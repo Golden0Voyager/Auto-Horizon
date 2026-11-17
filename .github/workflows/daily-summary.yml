@@ -83,9 +83,9 @@ jobs:
       - name: Push to Horizon gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.HORIZON_PUSH_TOKEN }}
+          personal_token: ${{ secrets.HORIZON_PUSH_TOKEN }}
           publish_dir: ./docs
           keep_files: true
           publish_branch: gh-pages
           enable_jekyll: true
-          repository_name: Golden0Voyager/Horizon
+          external_repository: Golden0Voyager/Horizon
