@@ -80,19 +80,12 @@ jobs:
           HORIZON_WEBHOOK_URL: ${{ secrets.HORIZON_WEBHOOK_URL }}
         run: uv run horizon
 
-      - name: Commit and push generated summaries
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add data/summaries/ docs/_posts/
-          git commit -m "📝 Daily Summary: $(date +'%Y-%m-%d') [skip ci]" || echo "No changes to commit"
-          git push
-
-      - name: Deploy to GitHub Pages
+      - name: Push to Horizon gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.HORIZON_PUSH_TOKEN }}
           publish_dir: ./docs
           keep_files: true
           publish_branch: gh-pages
           enable_jekyll: true
+          repository_name: Golden0Voyager/Horizon
