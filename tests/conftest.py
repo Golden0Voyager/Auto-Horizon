@@ -71,7 +71,31 @@ def _force_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     needed; pinning it keeps the suite deterministic on machines whose
     resolver answers with non-public (fake-IP) addresses.
     """
+    import ipaddress
     import socket
-    from unittest.mock import MagicMock
 
-    monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_PUBLIC_RESOLVE))
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        name = host.decode() if isinstance(host, bytes) else host
+        # Loopback and IP literals must still resolve for real: tests that spin
+        # up a local HTTP server (OAuth loopback, webhook receivers) connect to
+        # it, and fake tuples would crash socket() with family=None.
+        if name in {"", "localhost", None}:
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        try:
+            if ipaddress.ip_address(name).is_loopback:
+                return real_getaddrinfo(host, port, *args, **kwargs)
+        except ValueError:
+            pass
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port or 443),
+            )
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)

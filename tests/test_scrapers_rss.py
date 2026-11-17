@@ -27,6 +27,7 @@ def _client_with_text(text, status_code=200):
         resp.status_code = status_code
         resp.headers = {}
         resp.text = text
+        resp.content = text.encode()
         resp.raise_for_status = MagicMock(
             side_effect=Exception("http error") if status_code >= 400 else None
         )
@@ -39,7 +40,7 @@ def _client_with_text(text, status_code=200):
 def test_fetch_returns_empty_when_all_sources_disabled():
     sources = [RSSSourceConfig(name="x", url="https://example.com/feed.xml", enabled=False)]
     scraper = RSSScraper(sources, AsyncMock())
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -55,14 +56,14 @@ def test_fetch_parses_feed_via_feedparser(monkeypatch):
         }
     ]
 
-    def fake_parse(text):
+    def fake_parse(text, **kwargs):
         return _FeedDict({"entries": [_FeedDict(e) for e in sentinel]})
 
     monkeypatch.setattr("feedparser.parse", fake_parse)
 
     sources = [RSSSourceConfig(name="x", url="https://example.com/feed.xml")]
     scraper = RSSScraper(sources, _client_with_text("<xml/>"))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     assert result[0].title == "Sentinel Post"
     assert result[0].source_type.value == "rss"
@@ -77,18 +78,19 @@ def test_fetch_filters_old_entries(monkeypatch):
     ]
     monkeypatch.setattr(
         "feedparser.parse",
-        lambda t: _FeedDict({"entries": [_FeedDict(e) for e in sentinel]}),
+        lambda t, **kw: _FeedDict({"entries": [_FeedDict(e) for e in sentinel]}),
     )
     sources = [RSSSourceConfig(name="x", url="https://example.com/feed.xml")]
     scraper = RSSScraper(sources, _client_with_text("<xml/>"))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
-def test_extract_content_prefers_summary_over_description():
-    entry = _FeedDict({"summary": "the summary", "description": "the description"})
+def test_extract_content_prefers_longest_candidate():
+    """Upstream keeps the longest of content/summary/description."""
+    entry = _FeedDict({"summary": "short", "description": "the longer description"})
     content = RSSScraper([RSSSourceConfig(name="x", url="https://example.com/feed.xml")], AsyncMock())._extract_content(entry)
-    assert content == "the summary"
+    assert content == "the longer description"
 
 
 def test_extract_content_falls_back_to_description():
@@ -131,10 +133,7 @@ def test_fetch_expands_env_vars_in_url(monkeypatch):
     """URLs containing ``${VAR}`` placeholders are expanded from the OS environment."""
     monkeypatch.setenv("RSS_TOKEN", "secret")
     monkeypatch.setattr(
-        "feedparser.parse", lambda t: _FeedDict({"entries": []})
-    )
-    monkeypatch.setattr(
-        "feedparser.parse", lambda t: _FeedDict({"entries": []})
+        "feedparser.parse", lambda t, **kw: _FeedDict({"entries": []})
     )
 
     captured_url: dict = {}
@@ -145,6 +144,7 @@ def test_fetch_expands_env_vars_in_url(monkeypatch):
         resp.status_code = 200
         resp.headers = {}
         resp.text = "<xml/>"
+        resp.content = b"<xml/>"
         resp.raise_for_status = MagicMock(return_value=None)
         return resp
 
@@ -167,6 +167,12 @@ class _FeedDict(dict):
     """
 
     def __getattr__(self, key):
+        # feedparser.FeedParserDict always exposes these, defaulting them keeps
+        # fake feeds shaped like real ones for the bozo/entries checks.
+        if key == "bozo":
+            return self.get("bozo", False)
+        if key == "bozo_exception":
+            return self.get("bozo_exception")
         try:
             return self[key]
         except KeyError as exc:

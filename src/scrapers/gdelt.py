@@ -13,9 +13,8 @@ Design notes:
 * GDELT expresses source-language and source-country filters as query
   operators (``sourcelang:`` / ``sourcecountry:``) rather than separate
   parameters, so they are appended to the query string.
-* GDELT can return non-JSON or empty bodies on transient errors, so the
-  ``.json()`` call is guarded and an empty/missing ``articles`` key yields
-  an empty list rather than raising.
+* GDELT can return non-JSON bodies on transient errors; these are reported
+  as failures. An empty/missing ``articles`` key is a successful empty fetch.
 * A single malformed article is skipped, not allowed to abort the batch.
 """
 
@@ -29,7 +28,7 @@ import httpx
 from pydantic import HttpUrl
 
 from ..models import ContentItem, GDELTConfig, SourceType
-from .base import BaseScraper
+from .base import BaseScraper, FetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,13 @@ class GDELTScraper(BaseScraper):
         super().__init__({"gdelt": config}, http_client)
         self.gdelt_config = config
 
-    async def fetch(self, since: datetime) -> list[ContentItem]:
+    async def fetch(self, since: datetime) -> FetchResult:
+        result = FetchResult()
+        if self.gdelt_config.enabled:
+            await result.collect("articles", self._fetch_articles(since))
+        return result
+
+    async def _fetch_articles(self, since: datetime) -> list[ContentItem]:
         """Fetch articles from the GDELT DOC API.
 
         Args:
@@ -58,7 +63,7 @@ class GDELTScraper(BaseScraper):
                 the GDELT ``startdatetime`` unless ``timespan`` is set).
 
         Returns:
-            List[ContentItem]: Fetched content items.
+            list[ContentItem]: Fetched content items.
         """
         if not self.gdelt_config.enabled:
             return []
@@ -90,38 +95,22 @@ class GDELTScraper(BaseScraper):
             params["startdatetime"] = since_utc.strftime("%Y%m%d%H%M%S")
             params["enddatetime"] = now_utc.strftime("%Y%m%d%H%M%S")
 
-        try:
-            response = await self.http.get(
-                self.BASE_URL, params=params, follow_redirects=True
-            )
-            response.raise_for_status()
-
-            try:
-                payload = response.json()
-            except Exception as exc:
-                logger.warning("GDELT returned a non-JSON body: %s", exc)
-                return []
-
-            if not isinstance(payload, dict):
-                return []
-
-            articles = payload.get("articles")
-            if not articles:
-                return []
-
-            items: list[ContentItem] = []
-            for raw in articles:
-                item = self._raw_to_item(raw)
-                if item is not None:
-                    items.append(item)
-            return items
-
-        except httpx.HTTPError as exc:
-            logger.warning("Error fetching GDELT articles: %s", exc)
-            return []
-        except Exception as exc:
-            logger.warning("Error parsing GDELT response: %s", exc)
-            return []
+        response = await self.client.get(
+            self.BASE_URL, params=params, follow_redirects=True
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("GDELT returned an invalid response")
+        articles = payload.get("articles") or []
+        if not isinstance(articles, list):
+            raise ValueError("GDELT returned an invalid article list")
+        items: list[ContentItem] = []
+        for raw in articles:
+            item = self._raw_to_item(raw)
+            if item is not None:
+                items.append(item)
+        return items
 
     def _raw_to_item(self, raw: Any) -> ContentItem | None:
         """Map one GDELT article record into a ContentItem.
@@ -131,6 +120,10 @@ class GDELTScraper(BaseScraper):
         skipped rather than aborting the batch.
         """
         if not isinstance(raw, dict):
+            return None
+
+        # Validate before calling string methods so malformed rows stay isolated.
+        if any(not isinstance(raw.get(field), str) for field in ("url", "title", "seendate")):
             return None
 
         url = (raw.get("url") or "").strip()

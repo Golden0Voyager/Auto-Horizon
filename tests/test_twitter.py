@@ -1,36 +1,14 @@
-"""Tests for TwitterScraper.
-
-Test layer split
-================
-- Layer 1 (no Playwright required, runs in default CI):
-    Pure unit tests over ``_parse_tweet`` and ``fetch()`` early-return paths.
-    No httpx mock, no chromium, no async network. Exercises the contract
-    that the production Playwright + GraphQL interception implementation
-    exposes without spinning up a browser.
-- Layer 2 (``@pytest.mark.requires_playwright``, PR 2):
-    Real headless chromium with routed GraphQL responses to bypass x.com.
-    Will be gated by a separate nightly CI job.
-
-Reply/discussion/negative-branch tests pre-date this split. They exercise the
-still-Apify-based ``fetch_replies_for_item`` path and remain unchanged.
-"""
+"""Tests for TwitterScraper."""
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
-import pytest
-
-try:
-    from playwright.async_api import async_playwright as _async_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    _async_playwright = None
-    _PLAYWRIGHT_AVAILABLE = False
 
 from src.models import TwitterConfig
 from src.scrapers.twitter import TwitterScraper
+from src.scrapers.twitter_playwright import TwitterPlaywrightScraper
 
 
 def _make_config(**kwargs) -> TwitterConfig:
@@ -43,6 +21,30 @@ def _make_config(**kwargs) -> TwitterConfig:
     }
     defaults.update(kwargs)
     return TwitterConfig(**defaults)
+
+
+def _tweet(
+    tweet_id: str = "123456",
+    screen_name: str = "karpathy",
+    text: str = "Hello world",
+    created_at: str = None,
+    conversation_id: str = None,
+    **extra,
+) -> dict:
+    if created_at is None:
+        now = datetime.now(UTC)
+        created_at = now.strftime("%a %b %d %H:%M:%S +0000 %Y")
+    return {
+        "id_str": tweet_id,
+        "conversation_id": conversation_id or tweet_id,
+        "created_at": created_at,
+        "full_text": text,
+        "user": {"screen_name": screen_name, "name": screen_name.capitalize()},
+        "favorite_count": 10,
+        "retweet_count": 2,
+        "reply_count": 1,
+        **extra,
+    }
 
 
 def _reply_row(
@@ -71,209 +73,468 @@ def _status_resp(status="SUCCEEDED"):
     return {"data": {"status": status}}
 
 
-def _make_graphql_payload(
-    tweet_id: str,
-    text: str,
-    created_at_raw: str,
-    *,
-    is_retweet: bool = False,
-) -> dict:
-    """Build a single tweet at the shape ``extract_tweets`` looks for in ``_scrape_user``.
+# ---------------------------------------------------------------------------
+# Existing fetch tests
+# ---------------------------------------------------------------------------
 
-    ``extract_tweets`` in ``src/scrapers/twitter.py`` recursively walks the JSON
-    and matches any object containing both ``rest_id`` and ``legacy`` keys.
-    Plus it inspects ``core.retweeted_status_result`` for the ``is_retweet`` flag.
-    """
-    payload: dict = {
-        "rest_id": str(tweet_id),
-        "legacy": {
-            "full_text": text,
-            "created_at": created_at_raw,
-            "entities": {"media": []},
-            "extended_entities": {"media": []},
-        },
-    }
-    if is_retweet:
-        payload["core"] = {"retweeted_status_result": {}}
-    return payload
-
-
-def _wrap_graphql_response(*tweets: dict) -> dict:
-    """Wrap one or more tweet payloads in a minimal X.com timeline envelope.
-
-    The recursive walker accepts any nesting, so this wrapper only needs to
-    deliver the tweets somewhere reachable. Matches the shape typical replies
-    from ``UserTweets`` GraphQL operations.
-    """
-    return {
-        "data": {
-            "user": {
-                "result": {
-                    "timeline_v2": {
-                        "timeline": {
-                            "instructions": [
-                                {
-                                    "entries": [
-                                        {
-                                            "content": {
-                                                "itemContent": {
-                                                    "tweet_results": {"result": t},
-                                                },
-                                            },
-                                        }
-                                        for t in tweets
-                                    ],
-                                },
-                            ],
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-
-def _write_fake_cookie_file(tmp_path) -> None:
-    """Write one fake JSON cookie so ``_load_browser_cookies`` returns >=1 row."""
-    cookie_file = tmp_path / "x_cookies_1.json"
-    cookie_file.write_text(
-        json.dumps(
-            [
-                {
-                    "name": "auth_token",
-                    "value": "stub",
-                    "domain": ".x.com",
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": True,
-                },
-            ]
+def test_disabled_returns_empty():
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(enabled=False), client).fetch(
+            datetime.now(UTC)
         )
+    ).items
+    asyncio.run(client.aclose())
+    assert result == []
+
+
+def test_no_users_returns_empty():
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=[]), client).fetch(
+            datetime.now(UTC)
+        )
+    ).items
+    asyncio.run(client.aclose())
+    assert result == []
+
+
+def test_missing_token_returns_empty(monkeypatch):
+    monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(), client).fetch(datetime.now(UTC))
+    )
+    asyncio.run(client.aclose())
+    assert result.items == []
+    assert result.status == "failure"
+    assert "credentials" in result.failures
+
+
+def test_successful_fetch_returns_items(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    tweets = [_tweet("1"), _tweet("2", text="Another tweet")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=tweets)
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(profile="twitter-profile"), client).fetch(since)
+    ).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 2
+    assert result[0].source_type.value == "twitter"
+    assert result[0].metadata["favorite_count"] == 10
+    assert result[0].profile == "twitter-profile"
+
+
+def test_playwright_parse_tweet_propagates_profile():
+    scraper = TwitterPlaywrightScraper(
+        _make_config(profile="playwright-profile"), http_client=None
+    )
+    item = scraper._parse_tweet(
+        {
+            "tweet_id": "123",
+            "text": "Hello from Playwright",
+            "datetime": datetime.now(UTC).isoformat(),
+        },
+        "karpathy",
     )
 
-
-# ---------------------------------------------------------------------------
-# Layer 1 — fetch() early-return paths (no Playwright, no httpx mock)
-# ---------------------------------------------------------------------------
+    assert item is not None
+    assert item.profile == "playwright-profile"
 
 
-def test_fetch_disabled_returns_empty():
-    """``config.enabled=False`` short-circuits before any network call."""
-    scraper = TwitterScraper(_make_config(enabled=False))
-    result = asyncio.run(scraper.fetch(datetime.now(UTC)))
+def test_metadata_keys_aligned_for_analyzer(monkeypatch):
+    """Analyzer reads favorite_count/retweet_count/reply_count — verify they are set."""
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    tweets = [_tweet("42", **{"favorite_count": 99, "retweet_count": 7, "reply_count": 3})]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=tweets)
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(TwitterScraper(_make_config(), client).fetch(since)).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 1
+    meta = result[0].metadata
+    assert meta["favorite_count"] == 99
+    assert meta["retweet_count"] == 7
+    assert meta["reply_count"] == 3
+    assert meta["tweet_id"] == "42"
+    assert "conversation_id" in meta
+
+
+def test_filters_old_tweets(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC)
+    old = (since - timedelta(hours=2)).strftime("%a %b %d %H:%M:%S +0000 %Y")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[_tweet("1", created_at=old)])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(TwitterScraper(_make_config(), client).fetch(since)).items
+    asyncio.run(client.aclose())
     assert result == []
 
 
-def test_fetch_no_users_returns_empty():
-    """Empty / whitespace / @-only users lists are filtered to "" and short-circuit."""
-    for users in ([], ["", "  ", "@"], ["   "]):
-        scraper = TwitterScraper(_make_config(users=list(users)))
-        result = asyncio.run(scraper.fetch(datetime.now(UTC)))
-        assert result == [], f"users={users!r} should yield []"
+def test_run_failure_returns_empty(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp("FAILED"))
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(), client).fetch(
+            datetime.now(UTC) - timedelta(hours=1)
+        )
+    )
+    asyncio.run(client.aclose())
+    assert result.items == []
+    assert result.status == "failure"
 
 
-def test_fetch_no_cookie_files_returns_empty(tmp_path, monkeypatch):
-    """With Playwright installed but no cookie files in ``cookie_dir``, fetch() returns []."""
-    monkeypatch.setattr("src.scrapers.twitter.PLAYWRIGHT_AVAILABLE", True)
-    cfg = _make_config(cookie_dir=str(tmp_path), cookie_file_pattern="*.json")
-    scraper = TwitterScraper(cfg)
-    result = asyncio.run(scraper.fetch(datetime.now(UTC)))
+def test_start_run_http_error_returns_empty(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    transport = httpx.MockTransport(lambda r: httpx.Response(500, text="error"))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(), client).fetch(
+            datetime.now(UTC) - timedelta(hours=1)
+        )
+    )
+    asyncio.run(client.aclose())
+    assert result.items == []
+    assert result.status == "failure"
+
+
+def test_no_results_item_skipped(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[{"noResults": True}, _tweet("99")])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(TwitterScraper(_make_config(), client).fetch(since)).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 1
+    assert result[0].id == "twitter:tweet:99"
+
+
+def test_iso_date_fallback(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    iso_tweet = _tweet("77")
+    iso_tweet["created_at"] = datetime.now(UTC).isoformat()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[iso_tweet])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(TwitterScraper(_make_config(), client).fetch(since)).items
+    asyncio.run(client.aclose())
+    assert len(result) == 1
+
+
+def test_url_constructed_when_missing(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    tweet = _tweet("55", screen_name="testuser")
+    tweet.pop("url", None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[tweet])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(TwitterScraper(_make_config(), client).fetch(since)).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 1
+    assert "testuser" in str(result[0].url)
+    assert "55" in str(result[0].url)
+
+
+# ---------------------------------------------------------------------------
+# Keyword search fetch tests
+# ---------------------------------------------------------------------------
+
+def test_keywords_only_fetch_returns_items(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    tweets = [_tweet("k1", text="LLM news")]
+    posted = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            posted["n"] += 1
+            posted["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=tweets)
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=["LLM"]), client).fetch(since)
+    ).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 1
+    assert result[0].id == "twitter:tweet:k1"
+    assert posted["n"] == 1
+    assert posted["payload"]["source_mode"] == "search"
+    assert posted["payload"]["search_query"] == "LLM"
+    assert posted["payload"]["search_sort"] == "Latest"
+    assert posted["payload"]["max_items"] == 100
+
+
+def test_missing_token_with_keywords_returns_empty(monkeypatch):
+    monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=["AI"]), client).fetch(
+            datetime.now(UTC)
+        )
+    ).items
+    asyncio.run(client.aclose())
     assert result == []
 
 
-def test_fetch_no_playwright_returns_empty(monkeypatch):
-    """When ``PLAYWRIGHT_AVAILABLE`` is False, fetch() returns [] and skips the entire lifecycle."""
-    monkeypatch.setattr("src.scrapers.twitter.PLAYWRIGHT_AVAILABLE", False)
-    scraper = TwitterScraper(_make_config())
-    result = asyncio.run(scraper.fetch(datetime.now(UTC)))
+def test_empty_users_and_keywords_returns_empty():
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=[]), client).fetch(
+            datetime.now(UTC)
+        )
+    ).items
+    asyncio.run(client.aclose())
     assert result == []
 
 
+def test_keyword_run_timed_out_returns_empty(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp("TIMED-OUT"))
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=["AI"]), client).fetch(
+            datetime.now(UTC) - timedelta(hours=1)
+        )
+    ).items
+    asyncio.run(client.aclose())
+    assert result == []
+
+
+def test_keyword_failure_does_not_drop_user_tweets(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    user_tweets = [_tweet("u1", text="from timeline")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            body = json.loads(request.content)
+            if body.get("source_mode") == "profiles":
+                return httpx.Response(200, json=_run_resp("run-users", "ds-users"))
+            return httpx.Response(200, json=_run_resp("run-kw", "ds-kw"))
+        if request.url.path.endswith("/run-users"):
+            return httpx.Response(200, json=_status_resp("SUCCEEDED"))
+        if request.url.path.endswith("/run-kw"):
+            return httpx.Response(200, json=_status_resp("FAILED"))
+        if "/datasets/ds-users" in request.url.path:
+            return httpx.Response(200, json=user_tweets)
+        if "/datasets/ds-kw" in request.url.path:
+            raise AssertionError("failed keyword run should not fetch dataset")
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(
+            _make_config(users=["karpathy"], keywords=["AI"]), client
+        ).fetch(since)
+    )
+    asyncio.run(client.aclose())
+
+    assert len(result.items) == 1
+    assert result.items[0].id == "twitter:tweet:u1"
+    assert result.status == "partial_failure"
+    assert set(result.failures) == {"search:AI"}
+
+
+def test_keyword_no_results_returns_empty(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            return httpx.Response(200, json=_run_resp())
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[{"noResults": True}])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=["nobody-uses-this"]), client).fetch(
+            since
+        )
+    ).items
+    asyncio.run(client.aclose())
+    assert result == []
+
+
+def test_keyword_start_run_http_error_returns_empty(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    transport = httpx.MockTransport(lambda r: httpx.Response(500, text="error"))
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(_make_config(users=[], keywords=["AI"]), client).fetch(
+            datetime.now(UTC) - timedelta(hours=1)
+        )
+    ).items
+    asyncio.run(client.aclose())
+    assert result == []
+
+
+def test_users_and_keywords_dedupe_by_id(monkeypatch):
+    monkeypatch.setenv("APIFY_TOKEN", "test_token")
+    since = datetime.now(UTC) - timedelta(hours=1)
+    shared = _tweet("same", text="seen twice")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/runs" in request.url.path and request.method == "POST":
+            body = json.loads(request.content)
+            if body.get("source_mode") == "profiles":
+                return httpx.Response(200, json=_run_resp("run-users", "ds-users"))
+            return httpx.Response(200, json=_run_resp("run-kw", "ds-kw"))
+        if "/actor-runs/" in request.url.path:
+            return httpx.Response(200, json=_status_resp())
+        if "/datasets/" in request.url.path:
+            return httpx.Response(200, json=[shared])
+        raise AssertionError(f"Unexpected: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    result = asyncio.run(
+        TwitterScraper(
+            _make_config(users=["karpathy"], keywords=["LLM"]), client
+        ).fetch(since)
+    ).items
+    asyncio.run(client.aclose())
+
+    assert len(result) == 1
+    assert result[0].id == "twitter:tweet:same"
+
+
+def test_playwright_keywords_only_skips_without_users():
+    scraper = TwitterPlaywrightScraper(
+        _make_config(users=[], keywords=["LLM"], mode="playwright"),
+        http_client=None,
+    )
+    result = asyncio.run(scraper.fetch(datetime.now(UTC)))
+    assert result.items == []
+    assert result.status == "failure"
+    assert "keywords" in result.failures
+
+
+def test_playwright_browser_failure_is_reported(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import src.scrapers.twitter_playwright as module
+
+    @asynccontextmanager
+    async def browser_context():
+        yield SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(side_effect=RuntimeError("browser missing"))))
+
+    monkeypatch.setattr(module, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(module, "async_playwright", lambda: None, raising=False)
+    monkeypatch.setattr(module, "Stealth", lambda: SimpleNamespace(use_async=lambda _: browser_context()))
+    (tmp_path / "x_cookies_test.json").write_text("[]")
+    scraper = TwitterPlaywrightScraper(_make_config(mode="playwright", cookie_dir=str(tmp_path)))
+
+    result = asyncio.run(scraper.fetch(datetime.now(UTC)))
+    assert result.status == "failure"
+    assert result.failures["browser"] == "RuntimeError: browser missing"
+
+
 # ---------------------------------------------------------------------------
-# Layer 1 — _parse_tweet contract (GraphQL-shape input)
+# Reply fetch tests
 # ---------------------------------------------------------------------------
-
-
-def test_parse_tweet_metadata_keys_aligned_for_analyzer():
-    """``_parse_tweet`` writes the keys the downstream analyzer reads.
-
-    Note: the ``datetime`` field is the **post-`_scrape_user`-strptime** ISO form,
-    which is the shape ``_scrape_user`` writes into the dict (see
-    ``extract_tweets`` in twitter.py) before ``_parse_tweet`` consumes it.
-    """
-    scraper = TwitterScraper(_make_config())
-    raw = {
-        "tweet_id": "42",
-        "text": "Hello world",
-        "datetime": "2024-01-01T12:00:00+00:00",
-        "datetime_raw": "Mon Jan 01 12:00:00 +0000 2024",
-        "is_retweet": False,
-        "images": [],
-    }
-    item = scraper._parse_tweet(raw, "karpathy")
-    assert item is not None
-    assert item.metadata["tweet_id"] == "42"
-    assert item.metadata["is_retweet"] is False
-    assert item.metadata["images"] == []
-    assert item.author == "karpathy"
-    assert item.source_type.value == "twitter"
-    assert item.id == "twitter:tweet:42"
-
-
-def test_parse_tweet_invalid_dict_returns_none():
-    """``_parse_tweet`` returns ``None`` for any malformed input — no raise, no crash."""
-    scraper = TwitterScraper(_make_config())
-    cases = [
-        ({}, "empty dict"),
-        ({"text": "missing id"}, "missing tweet_id"),
-        ({"tweet_id": "1"}, "missing text"),
-        ({"tweet_id": "1", "text": "ok", "datetime": "not-a-date"}, "invalid datetime"),
-    ]
-    for raw, scenario in cases:
-        assert scraper._parse_tweet(raw, "x") is None, scenario
-
-
-def test_parse_tweet_accepts_iso_datetime():
-    """``_parse_tweet`` accepts ISO 8601 datetime strings — Layer 1 half of the
-    filters_old_tweets contract (time parsing must succeed before
-    ``_scrape_user`` can compare ``published_at < since``).
-    """
-    scraper = TwitterScraper(_make_config())
-    raw = {
-        "tweet_id": "77",
-        "text": "iso tweet",
-        "datetime": "2024-01-01T12:00:00+00:00",
-        "datetime_raw": "Mon Jan 01 12:00:00 +0000 2024",
-        "is_retweet": False,
-        "images": [],
-    }
-    item = scraper._parse_tweet(raw, "x")
-    assert item is not None
-    assert item.published_at.year == 2024
-    assert item.published_at.tzinfo is not None
-
-
-def test_parse_tweet_url_constructed_when_missing():
-    """``_parse_tweet`` synthesises the x.com status URL when none is provided."""
-    scraper = TwitterScraper(_make_config())
-    raw = {
-        "tweet_id": "55",
-        "text": "url test",
-        "datetime": "2024-01-01T12:00:00+00:00",
-        "datetime_raw": "Mon Jan 01 12:00:00 +0000 2024",
-        "is_retweet": False,
-        "images": [],
-    }
-    item = scraper._parse_tweet(raw, "testuser")
-    assert item is not None
-    assert "testuser" in str(item.url)
-    assert "55" in str(item.url)
-
-
-# ---------------------------------------------------------------------------
-# Reply fetch tests (Apify REST contract — unchanged)
-# ---------------------------------------------------------------------------
-
 
 def test_fetch_replies_disabled_by_default():
     """fetch_reply_text defaults to False — verify config default."""
@@ -402,347 +663,104 @@ def test_fetch_replies_no_conversation_id_returns_empty(monkeypatch):
     assert result == []
 
 
-# ---------------------------------------------------------------------------
-# Negative-branch coverage for fetch_replies_for_item (unchanged)
-# ---------------------------------------------------------------------------
+def test_poll_timeout_includes_http_request_time(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import src.scrapers.twitter as module
+
+    clock = [0.0]
+    timeouts = []
+
+    async def get(*args, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        clock[0] += 6.0
+        response = MagicMock()
+        response.json.return_value = {"data": {"status": "SUCCEEDED" if len(timeouts) == 2 else "RUNNING"}}
+        return response
+
+    async def sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+    monkeypatch.setattr(module, "_MAX_WAIT", 10)
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    scraper = TwitterScraper(TwitterConfig(), AsyncMock())
+    scraper.client.get.side_effect = get
+    assert asyncio.run(scraper._wait_for_run("synthetic-token", "synthetic-run")) is False
+    assert timeouts == [10.0, 1.0]
 
 
-def test_fetch_replies_run_start_5xx_returns_empty(monkeypatch):
-    """HTTP 500 on POST /runs short-circuits and never makes further calls."""
-    monkeypatch.setenv("APIFY_TOKEN", "test_token")
-    actor_id = _make_config().actor_id
-    captured: list[str] = []
+def test_poll_wall_clock_budget_cancels_a_blocked_request(monkeypatch):
+    from unittest.mock import AsyncMock
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.path)
-        if "/runs" in request.url.path and request.method == "POST":
-            return httpx.Response(500, json={"error": "upstream"})
-        raise AssertionError(f"Unexpected call after 5xx: {request.url}")
+    import src.scrapers.twitter as module
 
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    cfg = _make_config(fetch_reply_text=True)
-    scraper = TwitterScraper(cfg, client)
+    monkeypatch.setattr(module, "_MAX_WAIT", 0.05)
+    cancelled = []
 
-    from src.models import ContentItem, SourceType  # noqa: PLC0415
+    async def blocked_request(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
 
-    item = ContentItem(
-        id="twitter:tweet:42",
-        source_type=SourceType.TWITTER,
-        title="t",
-        url="https://twitter.com/x/status/42",
-        content="body",
-        author="x",
-        published_at=datetime.now(UTC),
-        metadata={"tweet_id": "42", "conversation_id": "42"},
-    )
-    result = asyncio.run(scraper.fetch_replies_for_item(item))
-    asyncio.run(client.aclose())
-
-    assert result == []
-    assert captured == [f"/v2/acts/{actor_id}/runs"]
-
-
-def test_fetch_replies_status_not_succeeded_returns_empty(monkeypatch):
-    monkeypatch.setenv("APIFY_TOKEN", "test_token")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if "/runs" in request.url.path and request.method == "POST":
-            return httpx.Response(200, json=_run_resp())
-        if "/actor-runs/" in request.url.path:
-            return httpx.Response(200, json=_status_resp("FAILED"))
-        raise AssertionError(f"Unexpected: {request.url}")
-
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    cfg = _make_config(fetch_reply_text=True)
-    scraper = TwitterScraper(cfg, client)
-
-    from src.models import ContentItem, SourceType  # noqa: PLC0415
-
-    item = ContentItem(
-        id="twitter:tweet:42",
-        source_type=SourceType.TWITTER,
-        title="t",
-        url="https://twitter.com/x/status/42",
-        content="body",
-        author="x",
-        published_at=datetime.now(UTC),
-        metadata={"tweet_id": "42", "conversation_id": "42"},
-    )
-    result = asyncio.run(scraper.fetch_replies_for_item(item))
-    asyncio.run(client.aclose())
-    assert result == []
-
-
-def test_fetch_replies_missing_run_id_in_response_returns_empty(monkeypatch):
-    monkeypatch.setenv("APIFY_TOKEN", "test_token")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if "/runs" in request.url.path and request.method == "POST":
-            return httpx.Response(200, json={"data": {}})  # no id / defaultDatasetId
-        raise AssertionError(f"Unexpected: {request.url}")
-
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    cfg = _make_config(fetch_reply_text=True)
-    scraper = TwitterScraper(cfg, client)
-
-    from src.models import ContentItem, SourceType  # noqa: PLC0415
-
-    item = ContentItem(
-        id="twitter:tweet:42",
-        source_type=SourceType.TWITTER,
-        title="t",
-        url="https://twitter.com/x/status/42",
-        content="body",
-        author="x",
-        published_at=datetime.now(UTC),
-        metadata={"tweet_id": "42", "conversation_id": "42"},
-    )
-    result = asyncio.run(scraper.fetch_replies_for_item(item))
-    asyncio.run(client.aclose())
-    assert result == []
-
-
-def test_fetch_replies_empty_dataset_returns_empty(monkeypatch):
-    monkeypatch.setenv("APIFY_TOKEN", "test_token")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if "/runs" in request.url.path and request.method == "POST":
-            return httpx.Response(200, json=_run_resp())
-        if "/actor-runs/" in request.url.path:
-            return httpx.Response(200, json=_status_resp())
-        if "/datasets/" in request.url.path:
-            return httpx.Response(200, json=[])
-        raise AssertionError(f"Unexpected: {request.url}")
-
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    cfg = _make_config(fetch_reply_text=True)
-    scraper = TwitterScraper(cfg, client)
-
-    from src.models import ContentItem, SourceType  # noqa: PLC0415
-
-    item = ContentItem(
-        id="twitter:tweet:42",
-        source_type=SourceType.TWITTER,
-        title="t",
-        url="https://twitter.com/x/status/42",
-        content="body",
-        author="x",
-        published_at=datetime.now(UTC),
-        metadata={"tweet_id": "42", "conversation_id": "42"},
-    )
-    result = asyncio.run(scraper.fetch_replies_for_item(item))
-    asyncio.run(client.aclose())
-    assert result == []
-
-
-def test_fetch_replies_all_below_min_likes_returns_empty(monkeypatch):
-    monkeypatch.setenv("APIFY_TOKEN", "test_token")
-    replies = [
-        _reply_row("r1", "alice", "low likes", likes=1),
-        _reply_row("r2", "bob", "less", likes=0),
-    ]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if "/runs" in request.url.path and request.method == "POST":
-            return httpx.Response(200, json=_run_resp())
-        if "/actor-runs/" in request.url.path:
-            return httpx.Response(200, json=_status_resp())
-        if "/datasets/" in request.url.path:
-            return httpx.Response(200, json=replies)
-        raise AssertionError(f"Unexpected: {request.url}")
-
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    cfg = _make_config(fetch_reply_text=True, reply_min_likes=10)
-    scraper = TwitterScraper(cfg, client)
-
-    from src.models import ContentItem, SourceType  # noqa: PLC0415
-
-    item = ContentItem(
-        id="twitter:tweet:42",
-        source_type=SourceType.TWITTER,
-        title="t",
-        url="https://twitter.com/x/status/42",
-        content="body",
-        author="x",
-        published_at=datetime.now(UTC),
-        metadata={"tweet_id": "42", "conversation_id": "42"},
-    )
-    result = asyncio.run(scraper.fetch_replies_for_item(item))
-    asyncio.run(client.aclose())
-    assert result == []
-
-
-# ---------------------------------------------------------------------------
-# Layer 2 — fetch() end-to-end with real chromium
-# ---------------------------------------------------------------------------
-
-# Stubbed x.com HTML shell. The inline script mirrors the GraphQL call the real
-# page would make, so the canned ``**/UserTweets*`` context route below is
-# actually requested and captured by the scraper's response listener.
-_STUB_X_DOC_BODY = (
-    "<!DOCTYPE html><html><body><div>stub</div>"
-    '<script>fetch("https://x.com/i/api/graphql/STUB/UserTweets?variables=%7B%7D");'
-    "</script></body></html>"
-)
-
-
-@pytest.mark.requires_playwright
-def test_fetch_end_to_end_routes_graphql(tmp_path, fast_twitter_waits, monkeypatch):
-    """Real chromium + routed GraphQL: ``fetch`` returns 1 parsed ContentItem.
-
-    Uses ``monkeypatch.setattr(scraper, "_scrape_user", wrapper)`` to inject
-    ``ctx.route()`` handlers before delegating to the real implementation —
-    keeps the seam at production boundaries (no internals poking).
-    """
-    if not _PLAYWRIGHT_AVAILABLE:
-        pytest.skip(
-            "Playwright Python package not installed; run: uv sync --extra twitter"
+    async def run():
+        scraper = TwitterScraper(TwitterConfig(), AsyncMock())
+        scraper.client.get.side_effect = blocked_request
+        result = await asyncio.wait_for(
+            scraper._wait_for_run("synthetic-token", "synthetic-run"), timeout=0.5,
         )
+        assert result is False
+        assert cancelled == [True]
 
-    _write_fake_cookie_file(tmp_path)
-    cfg = TwitterConfig(
-        enabled=True,
-        users=["testuser"],
-        cookie_dir=str(tmp_path),
-        cookie_file_pattern="x_cookies_*.json",
-        fetch_limit=3,
-    )
-    scraper = TwitterScraper(cfg)
-    canned = _wrap_graphql_response(
-        _make_graphql_payload("101", "New tweet", "Wed Jan 01 12:00:00 +0000 2025"),
-    )
-
-    orig_scrape = scraper._scrape_user
-
-    async def _mock_scrape(ctx, username, since):
-        # Registration order matters: context routes run in reverse
-        # registration order, so the specific GraphQL stubs are registered
-        # last and therefore win for API URLs; the x.com catch-all serves the
-        # document navigation only.
-        await ctx.route(
-            "https://x.com/**",
-            lambda route: route.fulfill(status=200, content_type="text/html", body=_STUB_X_DOC_BODY),
-        )
-        await ctx.route(
-            "**/UserByScreenName*",
-            lambda route: route.fulfill(
-                json={"data": {"user": {"result": {"rest_id": "stub", "legacy": {}}}}},
-                status=200,
-            ),
-        )
-        await ctx.route(
-            "**/UserTweets*",
-            lambda route: route.fulfill(json=canned, status=200),
-        )
-        return await orig_scrape(ctx, username, since)
-
-    monkeypatch.setattr(scraper, "_scrape_user", _mock_scrape)
-
-    monkeypatch.setattr(scraper, "_warm_up_contexts", lambda _contexts: asyncio.sleep(0))  # PR 3 seam
-
-    async def _run():
-        return await scraper.fetch(datetime.fromisoformat("2024-01-01T00:00:00+00:00"))
-
-    items = asyncio.run(_run())
-    assert len(items) == 1
-    assert items[0].metadata["tweet_id"] == "101"
-    assert "New tweet" in items[0].content
+    asyncio.run(run())
 
 
-@pytest.mark.requires_playwright
-def test_filters_old_tweets_layer2(tmp_path, fast_twitter_waits, monkeypatch):
-    """Layer 2 half of the filters_old contract: a pre-`since` tweet is filtered
-    out by ``_scrape_user`` even when GraphQL returns it.
-    """
-    if not _PLAYWRIGHT_AVAILABLE:
-        pytest.skip(
-            "Playwright Python package not installed; run: uv sync --extra twitter"
-        )
+def test_playwright_does_not_attribute_nested_quoted_tweets_to_timeline_owner(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
-    _write_fake_cookie_file(tmp_path)
-    cfg = TwitterConfig(
-        enabled=True,
-        users=["testuser"],
-        cookie_dir=str(tmp_path),
-        cookie_file_pattern="x_cookies_*.json",
-        fetch_limit=3,
-    )
-    scraper = TwitterScraper(cfg)
-    canned = _wrap_graphql_response(
-        _make_graphql_payload("101", "New tweet", "Wed Jan 01 12:00:00 +0000 2025"),
-        _make_graphql_payload("102", "Old tweet", "Sun Dec 31 12:00:00 +0000 2023"),
+    import src.scrapers.twitter_playwright as module
+
+    callbacks = {}
+    quoted = {"rest_id": "quoted", "legacy": {
+        "full_text": "Someone else's claim", "created_at": "Tue Jan 01 00:00:00 +0000 2030",
+    }}
+    payload = {"entries": [{"result": {"rest_id": "original", "legacy": {
+        "full_text": "Timeline owner comments on a quote", "created_at": "Tue Jan 01 00:00:00 +0000 2030",
+    }, "quoted_status_result": {"result": quoted}}}]}
+    page = SimpleNamespace(
+        on=lambda event, handler: callbacks.update({event: handler}),
+        route=AsyncMock(), close=AsyncMock(), evaluate=AsyncMock(return_value=""),
     )
 
-    orig_scrape = scraper._scrape_user
+    async def goto(*args, **kwargs):
+        await callbacks["response"](SimpleNamespace(
+            url="https://x.com/i/api/graphql/UserTweets", json=AsyncMock(return_value=payload),
+        ))
 
-    async def _mock_scrape(ctx, username, since):
-        # Registration order matters: context routes run in reverse
-        # registration order, so the specific GraphQL stubs are registered
-        # last and therefore win for API URLs; the x.com catch-all serves the
-        # document navigation only.
-        await ctx.route(
-            "https://x.com/**",
-            lambda route: route.fulfill(status=200, content_type="text/html", body=_STUB_X_DOC_BODY),
-        )
-        await ctx.route(
-            "**/UserByScreenName*",
-            lambda route: route.fulfill(
-                json={"data": {"user": {"result": {"rest_id": "stub", "legacy": {}}}}},
-                status=200,
-            ),
-        )
-        await ctx.route(
-            "**/UserTweets*",
-            lambda route: route.fulfill(json=canned, status=200),
-        )
-        return await orig_scrape(ctx, username, since)
-
-    monkeypatch.setattr(scraper, "_scrape_user", _mock_scrape)
-
-    monkeypatch.setattr(scraper, "_warm_up_contexts", lambda _contexts: asyncio.sleep(0))  # PR 3 seam
-
-    async def _run():
-        return await scraper.fetch(datetime.fromisoformat("2024-01-01T00:00:00+00:00"))
-
-    items = asyncio.run(_run())
-    assert len(items) == 1
-    assert items[0].metadata["tweet_id"] == "101"
+    page.goto = goto
+    monkeypatch.setattr(module.asyncio, "sleep", AsyncMock())
+    scraper = TwitterPlaywrightScraper(_make_config())
+    items = asyncio.run(scraper._scrape_user(
+        SimpleNamespace(new_page=AsyncMock(return_value=page)), "owner",
+        datetime(2029, 1, 1, tzinfo=UTC),
+    ))
+    assert [item["tweet_id"] for item in items] == ["original"]
+    assert items[0]["text"] == "Timeline owner comments on a quote"
 
 
-@pytest.mark.requires_playwright
-def test_scrape_page_error_returns_failed_users_layer2(tmp_path, fast_twitter_waits, monkeypatch):
-    """When ``_scrape_user`` returns ``None``, ``fetch`` queues the user for
-    retry; after both passes fail to collect tweets it returns ``[]``.
-    """
-    if not _PLAYWRIGHT_AVAILABLE:
-        pytest.skip(
-            "Playwright Python package not installed; run: uv sync --extra twitter"
-        )
-
-    _write_fake_cookie_file(tmp_path)
-    cfg = TwitterConfig(
-        enabled=True,
-        users=["testuser"],
-        cookie_dir=str(tmp_path),
-        cookie_file_pattern="x_cookies_*.json",
-        fetch_limit=3,
-    )
-    scraper = TwitterScraper(cfg)
-
-    async def _mock_scrape(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(scraper, "_scrape_user", _mock_scrape)
-
-    monkeypatch.setattr(scraper, "_warm_up_contexts", lambda _contexts: asyncio.sleep(0))  # PR 3 seam
-
-    async def _run():
-        return await scraper.fetch(datetime.now(UTC))
-
-    items = asyncio.run(_run())
-    assert items == []
+def test_self_replies_use_account_handle_not_display_name():
+    scraper = TwitterScraper(_make_config(), None)
+    raw = _tweet("original", screen_name="karpathy")
+    raw["user"]["name"] = "Andrej Karpathy"
+    item = scraper._parse_item(raw, datetime.now(UTC) - timedelta(days=1))
+    lines = scraper._extract_reply_lines(item, [
+        _reply_row("self", handle="KARPATHY", text="Author follow-up", likes=100),
+        _reply_row("other", handle="alice", text="Independent discussion", likes=10),
+    ], 3)
+    assert item.author == "Andrej Karpathy"
+    assert len(lines) == 1
+    assert "alice" in lines[0]
+    assert "Author follow-up" not in lines[0]

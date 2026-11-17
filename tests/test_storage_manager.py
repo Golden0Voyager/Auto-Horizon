@@ -221,11 +221,12 @@ def test_load_subscribers_returns_empty_when_missing(storage: StorageManager) ->
     assert storage.load_subscribers() == []
 
 
-def test_load_subscribers_returns_empty_on_invalid_json(
+def test_load_subscribers_raises_on_invalid_json(
     storage: StorageManager, tmp_data_dir: Path
 ) -> None:
     (tmp_data_dir / "subscribers.json").write_text("{not json", encoding="utf-8")
-    assert storage.load_subscribers() == []
+    with pytest.raises(ConfigError):
+        storage.load_subscribers()
 
 
 def test_add_subscriber_then_routes_via_load(

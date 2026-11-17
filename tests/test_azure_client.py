@@ -6,7 +6,9 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
+from openai import BadRequestError
 
 from src.ai.client import AzureOpenAIClient, create_ai_client
 from src.models import AIConfig, AIProvider
@@ -83,7 +85,11 @@ class TestAzureOpenAIClientComplete:
             client.client.chat.completions, "create", new_callable=AsyncMock
         ) as mock_create:
             mock_create.side_effect = [
-                RuntimeError("Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead."),
+                BadRequestError(
+                    "Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead.",
+                    response=httpx.Response(400, request=httpx.Request("POST", "https://example.com")),
+                    body=None,
+                ),
                 _mock_response(),
             ]
             result = asyncio.run(client.complete(system="test", user="hello"))

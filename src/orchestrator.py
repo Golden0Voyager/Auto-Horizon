@@ -5,6 +5,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import Literal
 from urllib.parse import unquote_plus, urlsplit
@@ -13,14 +14,17 @@ import httpx
 from rich.console import Console
 
 from .ai.analyzer import ContentAnalyzer
-from .ai.client import create_ai_client
+from .ai.client import AIClient, create_ai_client
 from .ai.enricher import ContentEnricher, EnrichmentBatchResult
+from .ai.errors import AIProviderUnavailableError
 from .ai.summarizer import DailySummarizer
 from .ai.tokens import get_usage_snapshot
 from .console_icons import get_icons
 from .models import Config, ContentItem
 from .processing import ProfileRegistry
+from .processing.content import COMMENTS_MARKER, split_content
 from .processing.tools import ToolRegistry
+from .scrapers.base import BaseScraper
 from .scrapers.gdelt import GDELTScraper
 from .scrapers.github import GitHubScraper
 from .scrapers.google_news import GoogleNewsScraper
@@ -121,9 +125,10 @@ class SourceFetchOutcome:
     """Result of fetching one configured source."""
 
     source_name: str
-    status: Literal["success", "empty", "failure"]
+    status: Literal["success", "empty", "partial_failure", "failure"]
     items: list[ContentItem] = field(default_factory=list)
     error: str | None = None
+    failures: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -133,6 +138,8 @@ class SourceFetchOutcome:
         }
         if self.error is not None:
             result["error"] = self.error
+        if self.failures:
+            result["failures"] = self.failures
         return result
 
 
@@ -146,7 +153,7 @@ class FetchReport:
     def status(self) -> Literal["not_attempted", "success", "partial_failure", "failure"]:
         if not self.outcomes:
             return "not_attempted"
-        if self.failed_count == len(self.outcomes):
+        if self.all_failed:
             return "failure"
         if self.failed_count:
             return "partial_failure"
@@ -154,11 +161,11 @@ class FetchReport:
 
     @property
     def failed_count(self) -> int:
-        return sum(outcome.status == "failure" for outcome in self.outcomes)
+        return sum(outcome.status in {"failure", "partial_failure"} for outcome in self.outcomes)
 
     @property
     def all_failed(self) -> bool:
-        return bool(self.outcomes) and self.failed_count == len(self.outcomes)
+        return bool(self.outcomes) and all(outcome.status == "failure" for outcome in self.outcomes)
 
     def failure_message(self) -> str:
         failures = "; ".join(
@@ -175,6 +182,7 @@ class FetchReport:
             "successful": len(self.outcomes) - self.failed_count,
             "empty": sum(outcome.status == "empty" for outcome in self.outcomes),
             "failed": self.failed_count,
+            "partial_failure": sum(outcome.status == "partial_failure" for outcome in self.outcomes),
             "item_count": sum(len(outcome.items) for outcome in self.outcomes),
             "sources": [outcome.to_dict() for outcome in self.outcomes],
         }
@@ -224,6 +232,7 @@ class HorizonOrchestrator:
                 for profile in self.profiles.profiles
                 if profile.id not in configured_profiles
             )
+        self.profiles.validate_digest_references(config.digest)
         self.email_manager = EmailManager(config.email, console=self.console) if config.email else None
         self.webhook_notifier = (
             WebhookNotifier(config.webhook, console=self.console, icons=self.icons)
@@ -237,11 +246,17 @@ class HorizonOrchestrator:
         )
         self.last_fetch_report: FetchReport | None = None
 
+    @cached_property
+    def ai_client(self) -> AIClient:
+        """Share one client and account selection across the run's AI stages."""
+        return create_ai_client(self.config.ai)
+
     async def run(self, force_hours: int | None = None) -> None:
         """Execute the complete workflow.
 
         Args:
-            force_hours: Optional override for time window in hours
+            force_hours: Hours already returned by collection_hours(). This
+                method does not check the window again.
         """
         self.console.print(
             f"[bold cyan]{self.icons['start']} Horizon - Starting aggregation...[/bold cyan]\n"
@@ -309,16 +324,27 @@ class HorizonOrchestrator:
             self.console.print("")
 
             # 6. Search related stories + enrich with background knowledge (2nd AI pass)
-            await self.enrich_items(important_items)
+            enrichment_result = await self.enrich_items(important_items)
+            if enrichment_result.status == "failure":
+                raise RuntimeError(
+                    f"Enrichment failed for all {len(important_items)} selected items: "
+                    + ", ".join(enrichment_result.failed_ids)
+                )
 
             # 7. Generate and save daily summaries for each configured language
             today = datetime.now(UTC).strftime("%Y-%m-%d")
+            summarizer = DailySummarizer(
+                profile_names=self.profiles.names,
+                profile_order=self.config.digest.profile_order,
+            )
             for lang in self.config.ai.languages:
-                summarizer = DailySummarizer(
-                    profile_names=self.profiles.names,
-                    profile_order=self.config.digest.profile_order,
+                language_items = [
+                    item for item in important_items
+                    if item.processing and lang in item.processing.artifacts
+                ]
+                summary = await self._generate_summary(
+                    language_items, today, len(all_items), language=lang, summarizer=summarizer
                 )
-                summary = await summarizer.generate_summary(important_items, today, len(all_items), language=lang)
 
                 # Save to data/summaries/
                 summary_path = self.storage.save_daily_summary(today, summary, language=lang)
@@ -380,7 +406,7 @@ class HorizonOrchestrator:
                 if self.webhook_notifier:
                     await self.webhook_notifier.send_daily_summary(
                         summary=summary,
-                        important_items=important_items,
+                        important_items=language_items,
                         all_items_count=len(all_items),
                         date=today,
                         lang=lang,
@@ -428,12 +454,8 @@ class HorizonOrchestrator:
             raise
 
     def _determine_time_window(self, force_hours: int | None = None) -> datetime:
-        if force_hours:
-            since = datetime.now(UTC) - timedelta(hours=force_hours)
-        else:
-            hours = self.config.collection.time_window_hours
-            since = datetime.now(UTC) - timedelta(hours=hours)
-        return since
+        hours = force_hours if force_hours is not None else self.config.collection.time_window_hours
+        return datetime.now(UTC) - timedelta(hours=hours)
 
     async def fetch_all_sources(self, since: datetime) -> list[ContentItem]:
         """Fetch content from all configured sources.
@@ -525,7 +547,9 @@ class HorizonOrchestrator:
 
             return all_items
 
-    async def _fetch_with_progress(self, name: str, scraper, since: datetime) -> SourceFetchOutcome:
+    async def _fetch_with_progress(
+        self, name: str, scraper: BaseScraper, since: datetime
+    ) -> SourceFetchOutcome:
         """Fetch from a scraper with progress indication.
 
         Args:
@@ -538,7 +562,7 @@ class HorizonOrchestrator:
         """
         self.console.print(f"{self.icons['fetch']} Fetching from {name}...")
         try:
-            items = await scraper.fetch(since)
+            result = await scraper.fetch(since)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self.console.print(f"[red]   Failed to fetch {name}: {error}[/red]")
@@ -548,7 +572,10 @@ class HorizonOrchestrator:
                 error=error,
             )
 
+        items = result.items
         self.console.print(f"   Found {len(items)} items from {name}")
+        for source, error in result.failures.items():
+            self.console.print(f"[yellow]   {name}/{source}: {error}[/yellow]")
 
         # Show per-sub-source breakdown when there are multiple sub-sources
         sub_counts: dict[str, int] = defaultdict(int)
@@ -560,8 +587,10 @@ class HorizonOrchestrator:
 
         return SourceFetchOutcome(
             source_name=name,
-            status="success" if items else "empty",
+            status=result.status,
             items=items,
+            error="; ".join(f"{source}: {error}" for source, error in result.failures.items()) or None,
+            failures=result.failures,
         )
 
     @staticmethod
@@ -653,9 +682,9 @@ class HorizonOrchestrator:
         This is a stable stage helper for integrations such as MCP.
 
         Sends all item titles, tags, and summaries to AI in a single call.
-        Items must already be sorted by analysis score descending so that the first
-        item in each duplicate group is always the highest-scored one.
-        Content (comments) from duplicate items is merged into the primary.
+        The highest-scored item of each duplicate group is kept as the primary.
+        Source text and community comments from duplicate items are merged into
+        the primary's source text and comments respectively.
 
         Falls back to returning items unchanged if the AI call fails.
         """
@@ -675,7 +704,7 @@ class HorizonOrchestrator:
         items_text = "\n\n".join(lines)
 
         try:
-            ai_client = create_ai_client(self.config.ai)
+            ai_client = self.ai_client
             response = await ai_client.complete(
                 system=TOPIC_DEDUP_SYSTEM,
                 user=TOPIC_DEDUP_USER.format(items=items_text),
@@ -687,6 +716,8 @@ class HorizonOrchestrator:
                 return items
 
             duplicate_groups = result.get("duplicates", [])
+        except AIProviderUnavailableError:
+            raise
         except Exception as e:
             if log:
                 self.console.print(f"[yellow]  dedup: AI call failed ({e}), skipping[/yellow]")
@@ -695,25 +726,65 @@ class HorizonOrchestrator:
         if not duplicate_groups:
             return items
 
+        def score_of(idx: int) -> float:
+            analysis = items[idx].processing.analysis if items[idx].processing else None
+            return analysis.score if analysis and analysis.score is not None else float("-inf")
+
+        # Keep valid indices only; groups that share an item describe one topic
+        if not isinstance(duplicate_groups, list):
+            duplicate_groups = []
+        parent = list(range(len(items)))
+
+        def find(idx: int) -> int:
+            while parent[idx] != idx:
+                parent[idx] = parent[parent[idx]]
+                idx = parent[idx]
+            return idx
+
+        grouped: set[int] = set()
+        for group in duplicate_groups:
+            if not isinstance(group, list):
+                continue
+            members = sorted({
+                idx
+                for idx in group
+                if isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < len(items)
+            })
+            if len(members) < 2:
+                continue
+            grouped.update(members)
+            for idx in members[1:]:
+                parent[find(idx)] = find(members[0])
+        clusters: dict[int, list[int]] = defaultdict(list)
+        for idx in sorted(grouped):
+            clusters[find(idx)].append(idx)
+
         # Build a set of indices to drop (all non-primary duplicates)
         drop_indices: set[int] = set()
-        for group in duplicate_groups:
-            if not isinstance(group, list) or len(group) < 2:
-                continue
-            primary_idx = group[0]
-            if primary_idx < 0 or primary_idx >= len(items):
-                continue
+        for members in clusters.values():
+            # Highest analysis score wins; ties keep the earlier (higher-ranked) item
+            primary_idx = min(members, key=lambda idx: (-score_of(idx), idx))
             primary = items[primary_idx]
-            for dup_idx in group[1:]:
-                if not isinstance(dup_idx, int) or dup_idx < 0 or dup_idx >= len(items):
-                    continue
+            for dup_idx in members:
                 if dup_idx == primary_idx:
                     continue
                 dup = items[dup_idx]
-                # Merge comments/content from the duplicate into the primary
-                if dup.content and (not primary.content or dup.content not in primary.content):
-                    label = dup.source_type.value
-                    primary.content = (primary.content or "") + f"\n\n--- From {label} ---\n{dup.content}"
+                # Merge the duplicate's source text before the primary's community
+                # comments so later stages still read it as source content
+                primary_parts = split_content(primary.content)
+                dup_parts = split_content(dup.content)
+                header = f"--- From {dup.source_type.value} ---"
+                main = primary_parts.main
+                if dup_parts.main and dup_parts.main not in main:
+                    main = f"{main}\n\n{header}\n{dup_parts.main}" if main else f"{header}\n{dup_parts.main}"
+                comments = primary_parts.comments
+                if dup_parts.comments and dup_parts.comments not in comments:
+                    labeled = f"{header}\n{dup_parts.comments}"
+                    comments = f"{comments}\n\n{labeled}" if comments else labeled
+                merged = main
+                if comments:
+                    merged = f"{main}\n\n{COMMENTS_MARKER}\n{comments}"
+                primary.content = merged or primary.content
                 if log:
                     self.console.print(
                         f"   [dim]dedup: keep [{primary_idx}] {primary.title}[/dim]\n"
@@ -872,15 +943,16 @@ class HorizonOrchestrator:
     ) -> BalancedDigestResult:
         """Apply configured category quotas and the final item cap.
 
-        Categories are read from ``item.metadata["category"]``. If a category
-        appears in more than one configured group, the first group in config
-        order wins.
+        Categories are read from ``item.metadata["category"]``, or from the
+        resolved ``item.processing.classification.profile`` when
+        ``digest.group_by`` is ``"profile"``. If a category appears in more than
+        one configured group, the first group in config order wins.
         """
         digest = self.config.digest
         groups = digest.category_groups
         max_items = digest.max_items
 
-        if not groups and max_items is None:
+        if not groups and max_items is None and digest.default_group_limit is None:
             return BalancedDigestResult(items=items)
 
         sorted_items = sorted(
@@ -916,9 +988,20 @@ class HorizonOrchestrator:
         default_group = digest.default_group
 
         for item in sorted_items:
-            item_category = item.metadata.get("category")
-            if isinstance(item_category, str):
-                group_key = category_to_group.get(item_category, default_group)
+            if digest.group_by == "profile":
+                category = (
+                    item.processing.classification.profile if item.processing else None
+                )
+            else:
+                category = item.metadata.get("category")
+            group_key = (
+                category_to_group.get(category, default_group)
+                if isinstance(category, str)
+                else default_group
+            )
+
+            if group_key in groups:
+                limit = groups[group_key].limit
             else:
                 group_key = default_group
 
@@ -1034,8 +1117,12 @@ class HorizonOrchestrator:
         self.console.print(
             f"   Re-analyzing {len(expanded)} Twitter items with reply context...\n"
         )
-        ai_client = create_ai_client(self.config.ai)
-        analyzer = ContentAnalyzer(ai_client, self.profiles, console=self.console)
+        ai_client = self.ai_client
+        analyzer = ContentAnalyzer(
+            ai_client, self.profiles, console=self.console,
+            concurrency=self.config.ai.analysis_concurrency,
+            throttle_sec=self.config.ai.throttle_sec,
+        )
         await analyzer.analyze_batch(expanded)
 
     async def enrich_items(self, items: list[ContentItem]) -> EnrichmentBatchResult:
@@ -1053,13 +1140,14 @@ class HorizonOrchestrator:
         self.console.print(
             f"{self.icons['enrich']} Enriching with background knowledge..."
         )
-        ai_client = create_ai_client(self.config.ai)
+        ai_client = self.ai_client
         enricher = ContentEnricher(
             ai_client,
             self.profiles,
             self.config.ai.languages,
             console=self.console,
             tools=ToolRegistry(self.storage.summaries_dir),
+            concurrency=self.config.ai.enrichment_concurrency,
         )
         result = await enricher.enrich_batch(items)
         self.console.print(
@@ -1073,6 +1161,35 @@ class HorizonOrchestrator:
         self.console.print("")
         return result
 
+    async def _generate_summary(
+        self,
+        items: list[ContentItem],
+        date: str,
+        total_fetched: int,
+        language: str = "en",
+        summarizer: DailySummarizer | None = None,
+    ) -> str:
+        """Generate the daily summary for one language.
+
+        Args:
+            items: Important items to include (already enriched with background/related)
+            date: Date string
+            total_fetched: Total items fetched
+            language: Output language ("en" or "zh")
+            summarizer: Reusable summarizer instance; built on demand when omitted
+
+        Returns:
+            str: Markdown summary
+        """
+        self.console.print(f"{self.icons['summary']} Generating daily summary...")
+
+        summarizer = summarizer or DailySummarizer(
+            profile_names=self.profiles.names,
+            profile_order=self.config.digest.profile_order,
+        )
+
+        return await summarizer.generate_summary(items, date, total_fetched, language=language)
+
     async def analyze_items(self, items: list[ContentItem]) -> list[ContentItem]:
         """Analyze content items with AI.
 
@@ -1084,34 +1201,11 @@ class HorizonOrchestrator:
         """
         self.console.print(f"{self.icons['ai']} Analyzing content with AI...")
 
-        ai_client = create_ai_client(self.config.ai)
-        analyzer = ContentAnalyzer(ai_client, self.profiles, console=self.console)
-
-        return await analyzer.analyze_batch(items)
-
-    async def _generate_summary(
-        self,
-        items: list[ContentItem],
-        date: str,
-        total_fetched: int,
-        language: str = "en",
-    ) -> str:
-        """Generate daily summary.
-
-        Args:
-            items: Important items to include (already enriched with background/related)
-            date: Date string
-            total_fetched: Total items fetched
-            language: Output language ("en" or "zh")
-
-        Returns:
-            str: Markdown summary
-        """
-        self.console.print(f"{self.icons['summary']} Generating daily summary...")
-
-        summarizer = DailySummarizer(
-            profile_names=self.profiles.names,
-            profile_order=self.config.digest.profile_order,
+        ai_client = self.ai_client
+        analyzer = ContentAnalyzer(
+            ai_client, self.profiles, console=self.console,
+            concurrency=self.config.ai.analysis_concurrency,
+            throttle_sec=self.config.ai.throttle_sec,
         )
 
-        return await summarizer.generate_summary(items, date, total_fetched, language=language)
+        return await analyzer.analyze_batch(items)

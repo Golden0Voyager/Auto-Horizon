@@ -9,10 +9,8 @@ import random
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import HttpUrl
-
 from ..models import ContentItem, SourceType, TwitterConfig
-from .base import BaseScraper
+from .base import BaseScraper, FetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +32,6 @@ def _get_proxy() -> str:
         if val:
             return val
     return ""
-
-
-PROXY = _get_proxy()
 
 
 def _load_browser_cookies(file_path: str) -> list[dict]:
@@ -68,45 +63,59 @@ class TwitterPlaywrightScraper(BaseScraper):
         super().__init__(config.model_dump(), http_client)
         self.twitter_config = config
 
-    async def fetch(self, since: datetime) -> list[ContentItem]:
+    async def fetch(self, since: datetime) -> FetchResult:
+        result = FetchResult()
         if not self.twitter_config.enabled:
-            return []
+            return result
 
-        # ``if u.strip().lstrip("@")`` drops names that become empty after
-        # stripping (e.g. ``"@"``), so a users list containing only such
-        # entries short-circuits instead of launching a browser.
-        users = [u.strip().lstrip("@") for u in self.twitter_config.users if u.strip().lstrip("@")]
+        users = [u.strip().lstrip("@") for u in self.twitter_config.users if u.strip()]
+        keywords = [k.strip() for k in self.twitter_config.keywords if k.strip()]
+        if keywords:
+            result.fail("keywords", ValueError("Keyword search requires Apify mode"))
+            logger.warning(
+                "Twitter keyword search is not supported in playwright mode; "
+                "skipping keywords %s. Use Apify mode (APIFY_TOKEN) to fetch by keyword.",
+                keywords,
+            )
         if not users:
             logger.debug("No Twitter users configured, skipping.")
-            return []
+            return result
 
         if not PLAYWRIGHT_AVAILABLE:
-            logger.warning(
-                "Playwright not installed. Run: uv sync --extra twitter && uv run playwright install chromium"
-            )
-            return []
+            result.fail("playwright", ImportError("Install the twitter extra and Chromium to enable this source"))
+            return result
 
         cookie_dir = Path(self.twitter_config.cookie_dir)
         pattern = self.twitter_config.cookie_file_pattern
         cookie_files = sorted(cookie_dir.glob(pattern))
         if not cookie_files:
-            logger.warning("No cookie files found matching %s in %s", pattern, cookie_dir)
-            return []
+            result.fail("cookies", FileNotFoundError(f"No cookie files matching {pattern} in {cookie_dir}"))
+            return result
 
+        try:
+            await self._fetch_users(since, users, cookie_files, result)
+        except Exception as exc:
+            result.fail("browser", exc)
+        return result
+
+    async def _fetch_users(
+        self, since: datetime, users: list[str], cookie_files: list[Path], result: FetchResult
+    ) -> None:
         logger.info(
             "Fetching Twitter (Playwright) for %d users using %d cookie sets",
             len(users),
             len(cookie_files),
         )
 
-        all_items: list[ContentItem] = []
+        all_items = result.items
         failed_users: list[tuple[str, int]] = []
         lock = asyncio.Lock()
 
         async with Stealth().use_async(async_playwright()) as p:  # type: ignore[union-attr]
             launch_kwargs: dict = {"headless": True}
-            if PROXY:
-                launch_kwargs["proxy"] = {"server": PROXY}
+            proxy = _get_proxy()
+            if proxy:
+                launch_kwargs["proxy"] = {"server": proxy}
             browser = await p.chromium.launch(**launch_kwargs)
 
             contexts = []
@@ -164,11 +173,14 @@ class TwitterPlaywrightScraper(BaseScraper):
                         parsed = [item for item in (self._parse_tweet(t, username) for t in tweets) if item]
                         async with lock:
                             all_items.extend(parsed)
+                            result.successful += 1
                     else:
                         consecutive_failures += 1
                         if not is_retry:
                             async with lock:
                                 failed_users.append((username, context_idx))
+                        else:
+                            result.fail(username, RuntimeError("Could not fetch timeline after retrying"))
 
             # Round-robin assign users to context queues
             queues: list[list[str]] = [[] for _ in range(num_contexts)]
@@ -198,7 +210,6 @@ class TwitterPlaywrightScraper(BaseScraper):
             await browser.close()
 
         logger.info("Fetched %d tweets via Playwright.", len(all_items))
-        return all_items
 
     async def _scrape_user(self, ctx, username: str, since: datetime) -> list[dict] | None:
         """Scrape a single user's tweets via GraphQL interception."""
@@ -240,6 +251,9 @@ class TwitterPlaywrightScraper(BaseScraper):
                             except (ValueError, TypeError):
                                 tweet["datetime"] = tweet["datetime_raw"]
                             graphql_tweets.append(tweet)
+                            # Nested quote/retweet records belong to other authors,
+                            # not separate posts by the requested timeline owner.
+                            return
                         for v in obj.values():
                             extract_tweets(v)
                     elif isinstance(obj, list):
@@ -261,11 +275,7 @@ class TwitterPlaywrightScraper(BaseScraper):
                 if any(k in url for k in ("google-analytics", "doubleclick", "scribe.twitter.com")):
                     await route.abort()
                 else:
-                    # fallback() (not continue_()) so context-level routes registered
-                    # on the browser context can still intercept. With no context
-                    # routes present (production), fallback() proceeds to the real
-                    # network, matching continue_() behaviour.
-                    await route.fallback()
+                    await route.continue_()
 
         await page.route("**/*", route_handler)
 
@@ -381,14 +391,16 @@ class TwitterPlaywrightScraper(BaseScraper):
                 id=self._generate_id(SourceType.TWITTER.value, "tweet", tweet_id),
                 source_type=SourceType.TWITTER,
                 title=f"@{username}: {title_body}",
-                url=HttpUrl(f"https://x.com/{username}/status/{tweet_id}"),
+                url=f"https://x.com/{username}/status/{tweet_id}",
                 content=text,
                 author=username,
                 published_at=published_at,
+                profile=self.twitter_config.profile,
                 metadata={
                     "tweet_id": tweet_id,
                     "is_retweet": tweet.get("is_retweet", False),
                     "images": tweet.get("images", []),
+                    "category": self.twitter_config.category,
                 },
             )
         except Exception as exc:

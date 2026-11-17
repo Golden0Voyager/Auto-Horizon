@@ -37,7 +37,7 @@ def test_fetch_returns_empty_when_obb_is_none(monkeypatch):
         watchlists=[OpenBBWatchlist(name="W", symbols=["AAPL"])],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -51,7 +51,7 @@ def test_fetch_returns_empty_when_config_disabled(monkeypatch):
         watchlists=[OpenBBWatchlist(name="W", symbols=["AAPL"])],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -76,7 +76,7 @@ def test_fetch_dedups_urls_across_watchlists(monkeypatch):
         ],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     assert result[0].metadata["watchlist"] == "W1"
 
@@ -172,7 +172,7 @@ def test_fetch_skips_disabled_watchlist(monkeypatch):
         watchlists=[OpenBBWatchlist(name="off", symbols=["AAPL"], enabled=False)],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -187,7 +187,7 @@ def test_fetch_skips_watchlist_with_no_symbols(monkeypatch):
         watchlists=[OpenBBWatchlist(name="empty", symbols=[])],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -221,6 +221,6 @@ def test_fetch_watchlist_exception_does_not_block_others(monkeypatch):
         ],
     )
     scraper = OpenBBScraper(config, http_client=None)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     assert result[0].metadata["watchlist"] == "ok"

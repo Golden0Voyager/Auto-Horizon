@@ -21,6 +21,7 @@ from src.models import (
     TwitterConfig,
 )
 from src.orchestrator import HorizonOrchestrator, SourceFetchOutcome
+from src.scrapers.base import FetchResult
 from src.storage.manager import StorageManager
 
 
@@ -190,7 +191,7 @@ def test_fetch_with_progress_prints_sub_source_breakdown(
         _item(metadata={"subreddit": "ai"}),
     ]
     scraper_mock = MagicMock()
-    scraper_mock.fetch = AsyncMock(return_value=items)
+    scraper_mock.fetch = AsyncMock(return_value=FetchResult(items=items))
     asyncio.run(orchestrator._fetch_with_progress("Reddit", scraper_mock, dt.now(UTC)))
     captured = capsys.readouterr()
     # Output goes through the shared stderr console (upstream #138).
@@ -257,7 +258,7 @@ def test_fetch_all_sources_instantiates_github_scraper(
     _disable_default_sources(orchestrator)
     orchestrator.config.sources.github = [GitHubSourceConfig(type="repo_releases", owner="test", repo="test")]
     with patch("src.orchestrator.GitHubScraper") as fake_github:
-        fake_github.return_value.fetch = AsyncMock(return_value=[])
+        fake_github.return_value.fetch = AsyncMock(return_value=FetchResult())
         asyncio.run(orchestrator.fetch_all_sources(datetime(2026, 1, 1, tzinfo=UTC)))
     fake_github.assert_called_once()
 
@@ -274,6 +275,6 @@ def test_fetch_all_sources_instantiates_openbb_scraper(
     _disable_default_sources(orchestrator)
     orchestrator.config.sources.openbb = OpenBBConfig(enabled=True)
     with patch("src.orchestrator.OpenBBScraper") as fake_openbb:
-        fake_openbb.return_value.fetch = AsyncMock(return_value=[])
+        fake_openbb.return_value.fetch = AsyncMock(return_value=FetchResult())
         asyncio.run(orchestrator.fetch_all_sources(datetime(2026, 1, 1, tzinfo=UTC)))
     fake_openbb.assert_called_once()

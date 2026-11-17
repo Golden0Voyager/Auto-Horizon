@@ -48,7 +48,7 @@ def test_fetch_returns_empty_when_all_sources_disabled():
         GitHubSourceConfig(type="repo_releases", owner="x", repo="y", enabled=False),
     ]
     scraper = GitHubScraper(config, AsyncMock())
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -63,7 +63,7 @@ def test_fetch_user_events_filters_to_supported_types():
          "repo": {"name": "octocat/hello"}, "payload": {}},
     ]
     scraper = GitHubScraper(config, _client_with_json(events))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 2
     types = {item.metadata["event_type"] for item in result}
     assert types == {"PushEvent", "WatchEvent"}
@@ -78,7 +78,7 @@ def test_fetch_user_events_filters_by_date():
          "repo": {"name": "octocat/hello"}, "payload": {"commits": []}},
     ]
     scraper = GitHubScraper(config, _client_with_json(events))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     assert result[0].metadata["event_type"] == "PushEvent"
 
@@ -86,7 +86,7 @@ def test_fetch_user_events_filters_by_date():
 def test_fetch_user_events_handles_http_error():
     config = [GitHubSourceConfig(type="user_events", username="missing", enabled=True)]
     scraper = GitHubScraper(config, _client_with_json({}, status_code=500))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     # Production catches httpx.HTTPError → empty list.
     assert result == []
 
@@ -102,7 +102,7 @@ def test_fetch_repo_releases_includes_prerelease_flag():
          "prerelease": True},
     ]
     scraper = GitHubScraper(config, _client_with_json(releases))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 2
     pr_flags = [item.metadata["prerelease"] for item in result]
     assert False in pr_flags

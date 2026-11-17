@@ -36,7 +36,6 @@ from src.mcp.errors import HorizonMcpError
 from src.models import (
     AIProvider,
     Config,
-    ContentItem,
     OSSInsightConfig,
     SourceType,
 )
@@ -94,16 +93,16 @@ def test_hz_horizon_adapter_resolve_raises_when_no_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Stub ``_is_horizon_repo`` so every candidate path fails its check,
-    # forcing ``resolve_horizon_path`` to exhaust the candidates loop and
-    # raise ``HZ_HORIZON_NOT_FOUND`` instead of returning the real repo
-    # under the test process's CWD.
-    monkeypatch.setattr(horizon_adapter, "_is_horizon_repo", lambda path: False)
-    explicit = tmp_path / "fake_repo"
-    explicit.mkdir()
-
+    # An explicit workspace only has to exist; a missing one is an error.
     with pytest.raises(HorizonMcpError) as exc_info:
-        horizon_adapter.resolve_horizon_path(explicit=str(explicit))
+        horizon_adapter.resolve_horizon_path(explicit=str(tmp_path / "missing"))
+    assert exc_info.value.code == "HZ_INVALID_HORIZON_PATH"
+
+    # Without an explicit path, every candidate is probed and reported.
+    monkeypatch.delenv("HORIZON_PATH", raising=False)
+    monkeypatch.setattr(horizon_adapter, "_is_horizon_repo", lambda path: False)
+    with pytest.raises(HorizonMcpError) as exc_info:
+        horizon_adapter.resolve_horizon_path()
     assert exc_info.value.code == "HZ_HORIZON_NOT_FOUND"
     assert "checked" in exc_info.value.details
 
@@ -277,10 +276,7 @@ def test_hz_horizon_adapter_dicts_to_items_round_trip() -> None:
         "published_at": datetime.now(UTC).isoformat(),
     }
 
-    class _Runtime:
-        ContentItem = ContentItem
-
-    items = horizon_adapter.dicts_to_items(_Runtime(), [payload])
+    items = horizon_adapter.dicts_to_items([payload])
     assert len(items) == 1
     assert items[0].id == payload["id"]
     assert horizon_adapter.items_to_dicts(items)[0]["id"] == payload["id"]
@@ -421,8 +417,7 @@ def test_hz_horizon_adapter_load_config_expands_env_vars(
     )
     monkeypatch.setenv("TEST_BASE_URL", "https://api.example.com")
 
-    runtime = horizon_adapter.load_runtime(hz_horizon_adapter_minimal_repo)
-    config = horizon_adapter.load_config(runtime, config_path)
+    config = horizon_adapter.load_config(config_path)
 
     assert config.ai.base_url == "https://api.example.com/v1"
 

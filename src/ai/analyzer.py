@@ -6,19 +6,19 @@ import logging
 from pydantic import ValidationError
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from ..models import ContentAnalysis, ContentItem
 from ..processing.content import select_content, split_content
 from ..processing.profiles import ProfileRegistry
 from .classifier import ContentClassifier
 from .client import AIClient
+from .errors import AIProviderUnavailableError
 from .prompting.analysis import analysis_system_prompt, analysis_user_prompt
-from .utils import parse_json_response
+from .utils import gather_ai_tasks, parse_json_response
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_THROTTLE_SEC = 0.0
 
 class ContentAnalyzer:
     """Analyzes content items using AI to determine importance."""
@@ -28,11 +28,34 @@ class ContentAnalyzer:
         ai_client: AIClient,
         profiles: ProfileRegistry,
         console: Console | None = None,
+        *,
+        concurrency: int | None = None,
+        throttle_sec: float | None = None,
     ):
         self.client = ai_client
         self.profiles = profiles
         self.classifier = ContentClassifier(ai_client, profiles)
         self.console = console or Console(stderr=True)
+        self.concurrency = None if concurrency is None else max(concurrency, 1)
+        self.throttle_sec = None if throttle_sec is None else max(throttle_sec, 0.0)
+
+    def _get_throttle_sec(self) -> float:
+        """Return the inter-item throttle, clamped to zero or above.
+
+        An explicit constructor value wins; otherwise the AI client's config is
+        used so a config edit takes effect without rebuilding the analyzer.
+        """
+        if self.throttle_sec is not None:
+            return self.throttle_sec
+        config = getattr(self.client, "config", None)
+        return max(getattr(config, "throttle_sec", 0.0) or 0.0, 0.0)
+
+    def _get_concurrency(self) -> int:
+        """Return the analysis concurrency, clamped to 1 or above."""
+        if self.concurrency is not None:
+            return self.concurrency
+        config = getattr(self.client, "config", None)
+        return max(getattr(config, "analysis_concurrency", 1) or 1, 1)
 
     @staticmethod
     def _parse_json_response(response: str) -> dict | None:
@@ -42,27 +65,15 @@ class ContentAnalyzer:
         """
         return parse_json_response(response)
 
-    def _get_throttle_sec(self) -> float:
-        """Return the configured inter-item throttle, clamped to zero or above."""
-        config = getattr(self.client, "config", None)
-        throttle_sec = getattr(config, "throttle_sec", DEFAULT_THROTTLE_SEC)
-        return max(throttle_sec, 0.0)
-
-    def _get_concurrency(self) -> int:
-        """Return the configured analysis concurrency, clamped to 1 or above."""
-        config = getattr(self.client, "config", None)
-        concurrency = getattr(config, "analysis_concurrency", 1)
-        return max(concurrency, 1)
-
     async def analyze_batch(self, items: list[ContentItem]) -> list[ContentItem]:
-        throttle_sec = self._get_throttle_sec()
-        concurrency = self._get_concurrency()
-        semaphore = asyncio.Semaphore(concurrency)
+        semaphore = asyncio.Semaphore(self._get_concurrency())
 
         async def _process(item: ContentItem, index: int, progress_task) -> ContentItem:
             async with semaphore:
                 try:
                     await self._analyze_item(item)
+                except AIProviderUnavailableError:
+                    raise
                 except Exception as e:
                     logger.error("Error analyzing item %s: %s", item.id, e)
                     if item.processing:
@@ -71,11 +82,13 @@ class ContentAnalyzer:
                             reason="Analysis failed",
                             summary=item.title,
                         )
-                    # Mirror the failure onto the legacy flat fields.
+                    # Mirror the failure onto the legacy flat fields. The fork's
+                    # threshold filtering treats a 0.0 score as "drop the item".
                     item.ai_score = 0.0
                     item.ai_reason = "Analysis failed"
                     item.ai_summary = item.title
                     item.ai_tags = []
+                throttle_sec = self._get_throttle_sec()
                 if throttle_sec > 0 and index < len(items) - 1:
                     await asyncio.sleep(throttle_sec)
             progress.advance(progress_task)
@@ -93,11 +106,12 @@ class ContentAnalyzer:
             coros = [
                 _process(item, i, task) for i, item in enumerate(items)
             ]
-            analyzed_items = await asyncio.gather(*coros)
+            analyzed_items = await gather_ai_tasks(coros)
 
         return analyzed_items
 
     @retry(
+        retry=retry_if_exception_type(Exception) & retry_if_not_exception_type(AIProviderUnavailableError),
         stop=stop_after_attempt(3),
         wait=wait_exponential(min=2, max=10)
     )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import shlex
 import sys
 from pathlib import Path
@@ -13,8 +12,10 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from ._cli import add_data_dir_arguments, add_log_level_argument
+from .collection_window import collection_hours
 from .console_icons import get_icons
 from .logging_config import configure_logging
+from .models import AIProvider
 from .orchestrator import HorizonOrchestrator
 from .storage.manager import ConfigError, StorageManager
 
@@ -37,22 +38,24 @@ def print_banner():
     console.print(banner)
 
 
+def _hours_argument(value: str) -> int:
+    """Parse the CLI override. Positivity is checked later, once, with the config value."""
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from exc
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Build the CLI parser and return parsed args.
 
-    Extracted from :func:`main` so tests can monkeypatch the seam directly,
-    bypassing the global ``argparse.ArgumentParser.parse_args`` import path
-    (which has produced flaky ``unrecognized arguments`` noise across CI
-    platforms and is brittle to any unrelated argparse change in conftest).
+    Split out of :func:`main` so tests can exercise argument handling without
+    touching the network, the filesystem, or ``sys.argv``.
     """
-
-    parser = argparse.ArgumentParser(
-        description="Horizon - AI-Driven Information Aggregation System",
-    )
-    parser.add_argument("--hours", type=int, help="Force fetch from last N hours")
+    parser = argparse.ArgumentParser(description="Horizon - AI-Driven Information Aggregation System")
+    parser.add_argument("--hours", type=_hours_argument, help="Force fetch from last N hours")
     add_data_dir_arguments(parser)
-    # Keep the fork's HORIZON_LOG override working alongside upstream's -l/--log-level flag.
-    add_log_level_argument(parser, default=os.getenv("HORIZON_LOG", "WARNING").upper())
+    add_log_level_argument(parser)
     return parser.parse_args(argv)
 
 
@@ -116,10 +119,19 @@ def main():
             sys.exit(1)
 
         icons = get_icons(config.display.icon_style)
+        if config.ai.provider == AIProvider.OPENAI_CHATGPT:
+            from .ai.chatgpt_auth import MANAGE_USAGE_URL
+            console.print(f"Using ChatGPT plan. Manage usage: {MANAGE_USAGE_URL}")
 
-        # Create and run orchestrator
+        # Config value and CLI override meet here. The orchestrator receives the int.
+        try:
+            window = collection_hours(config.collection.time_window_hours, args.hours)
+        except ValueError as exc:
+            console.print(f"[bold red]{icons['error']} {exc}[/bold red]")
+            sys.exit(2)
+
         orchestrator = HorizonOrchestrator(config, storage, console=console)
-        asyncio.run(orchestrator.run(force_hours=args.hours))
+        asyncio.run(orchestrator.run(force_hours=window))
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]{icons['warning']} Interrupted by user[/yellow]")
@@ -128,86 +140,6 @@ def main():
         console.print(f"\n[bold red]{icons['error']} Fatal error: {e}[/bold red]")
         console.print_exception()
         sys.exit(1)
-
-
-def print_config_template():
-    """Print configuration template."""
-    template = """
-{
-  "ai": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4.5-20250929",
-    "api_key_env": "ANTHROPIC_API_KEY",
-    "temperature": 0.3,
-    "max_tokens": 4096
-  },
-  "display": {
-    "icon_style": "emoji"
-  },
-  "sources": {
-    "github": [
-      {
-        "type": "user_events",
-        "username": "torvalds",
-        "enabled": true,
-        "profile": "tech-news"
-      }
-    ],
-    "hackernews": {
-      "enabled": true,
-      "fetch_top_stories": 30,
-      "min_score": 100,
-      "profile": "tech-news"
-    },
-    "rss": [
-      {
-        "name": "Example Blog",
-        "url": "https://example.com/feed.xml",
-        "enabled": true,
-        "category": "software-engineering",
-        "profile": "auto"
-      }
-    ]
-  },
-  "collection": {
-    "time_window_hours": 24
-  },
-  "digest": {
-    "max_items": null,
-    "profile_order": [
-      "tech-news",
-      "tech-blog",
-      "finance-news"
-    ],
-    "category_groups": {},
-    "default_group": "other",
-    "default_group_limit": null
-  },
-  "processing": {
-    "profiles_dir": "profiles",
-    "default_profile": "tech-news",
-    "profile_settings": {
-      "tech-news": {
-        "threshold": 7.0,
-        "topic_dedup": true
-      },
-      "tech-blog": {
-        "threshold": 4.0,
-        "topic_dedup": false
-      },
-      "finance-news": {
-        "threshold": 7.0,
-        "topic_dedup": true
-      }
-    }
-  }
-}
-
-Also create a .env file with:
-ANTHROPIC_API_KEY=your_api_key_here
-GITHUB_TOKEN=your_github_token_here (optional but recommended)
-"""
-    console.print(template)
 
 
 if __name__ == "__main__":

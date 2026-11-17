@@ -3,7 +3,7 @@
 Covers the happy path (``main`` calls ``orchestrator.run``), and the various
 ``sys.exit(N)`` branches: missing ``config.json`` (with/without
 ``config.example.json`` template), ``ConfigError``, generic exceptions, and
-``KeyboardInterrupt``. ``print_config_template`` is exercised as a sanity
+``KeyboardInterrupt``.
 check that it does not crash.
 """
 
@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.main import _parse_args, main, print_config_template
+from src.main import _parse_args, main
 from src.storage.manager import ConfigError
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,8 @@ def test_main_runs_orchestrator_with_no_args(minimal_config: Path, monkeypatch: 
     )
 
     main()
-    fake_run.assert_called_once_with(force_hours=None)
+    # main() always resolves the window from config (default 24h).
+    fake_run.assert_called_once_with(force_hours=24)
 
 
 def test_main_passes_force_hours_to_orchestrator(minimal_config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,15 +199,6 @@ def test_main_generic_orchestrator_exception_exits_one(minimal_config: Path, mon
     with patch("sys.exit", side_effect=SystemExit(1)) as exit_mock, pytest.raises(SystemExit):
         main()
     exit_mock.assert_called_with(1)
-
-
-# ---------------------------------------------------------------------------
-# print_config_template smoke
-# ---------------------------------------------------------------------------
-
-
-def test_print_config_template_does_not_raise() -> None:
-    print_config_template()
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+
 from src.models import TelegramChannelConfig, TelegramConfig
 from src.scrapers.telegram import TelegramScraper
 
@@ -38,7 +40,7 @@ def _client_with_text(text, status_code=200, headers=None):
 def test_fetch_returns_empty_when_disabled():
     config = TelegramConfig(enabled=False, channels=[])
     scraper = TelegramScraper(config, AsyncMock())
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -59,7 +61,7 @@ def test_parse_message_extracts_first_external_link():
     </body></html>
     """
     scraper = TelegramScraper(config, _client_with_text(html))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     # First external (non-t.me) link wins → "https://example.com/article".
     assert str(result[0].url) == "https://example.com/article"
@@ -80,7 +82,7 @@ def test_parse_message_falls_back_to_tme_url():
     </body></html>
     """
     scraper = TelegramScraper(config, _client_with_text(html))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     assert str(result[0].url) == "https://telegram.me/tech/99"
 
@@ -95,7 +97,7 @@ def test_parse_message_skips_missing_post_id():
       </div>
     </body></html>"""
     scraper = TelegramScraper(config, _client_with_text(html))
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -119,8 +121,8 @@ def test_make_title_hard_truncates_when_no_punctuation():
     assert len(title) == 80
 
 
-def test_fetch_raises_when_all_channels_fail():
-    """When every channel request fails, the scraper raises (upstream semantics)."""
+def test_fetch_reports_failure_when_all_channels_fail():
+    """When every channel request fails, the failure lands in FetchResult."""
     cfg = TelegramChannelConfig(channel="tech", fetch_limit=10)
     config = TelegramConfig(channels=[cfg])
 
@@ -131,13 +133,14 @@ def test_fetch_raises_when_all_channels_fail():
         resp.status_code = 500
         resp.headers = {}
         resp.text = ""
-        resp.raise_for_status = MagicMock(side_effect=Exception("server error"))
+        resp.raise_for_status = MagicMock(side_effect=httpx.HTTPError("server error"))
         return resp
 
     client.get = fake_get
     scraper = TelegramScraper(config, client)
 
-    import pytest
+    result = asyncio.run(scraper.fetch(_since()))
 
-    with pytest.raises(RuntimeError, match="All Telegram channels failed"):
-        asyncio.run(scraper.fetch(_since()))
+    assert result.items == []
+    assert "tech" in result.failures
+    assert "All Telegram endpoints failed" in result.failures["tech"]

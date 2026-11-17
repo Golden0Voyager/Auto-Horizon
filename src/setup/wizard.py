@@ -76,27 +76,42 @@ def configure_ai() -> AIConfig | None:
     provider_enum = AIProvider(provider)
 
     provider_defaults = AI_PROVIDER_DEFAULTS.get(provider_enum, {})
-    model = Prompt.ask(
-        "Model name", default=provider_defaults.get("model", ""), console=console
-    )
-
-    if provider_enum == AIProvider.OLLAMA:
-        base_url = Prompt.ask(
-            "Ollama base URL (leave empty for http://localhost:11434)",
-            default="",
-            console=console,
+    chatgpt_account = None
+    if provider_enum == AIProvider.OPENAI_CHATGPT:
+        from ..ai.chatgpt_auth import MANAGE_USAGE_URL, ChatGPTAuth
+        auth = ChatGPTAuth()
+        session = auth.status()
+        if not session.get("plan_usage"):
+            console.print("Continue with ChatGPT in your browser.")
+            session = auth.sign_in(
+                enable_plan=session.get("connected", False),
+                show_url=lambda url: console.print(url, markup=False, soft_wrap=True),
+            )
+        chatgpt_account = session["client_id"]
+        catalog = auth.models(chatgpt_account)
+        if not catalog:
+            raise ValueError("No models are available for this ChatGPT account.")
+        for entry in catalog:
+            console.print(f"  {entry['slug']}: {entry['display_name']}", markup=False)
+        model = Prompt.ask(
+            "ChatGPT model", choices=[entry["slug"] for entry in catalog],
+            default=catalog[0]["slug"], console=console,
         )
+        base_url, api_key_env = "", ""
+        console.print(f"Using ChatGPT plan. Manage usage: {MANAGE_USAGE_URL}")
     else:
-        base_url = Prompt.ask(
-            "Base URL (leave empty for default)", default="", console=console
+        model = Prompt.ask(
+            "Model name", default=provider_defaults.get("model", ""), console=console
         )
-
-    # Determine default env var name
-    api_key_env = Prompt.ask(
-        "API key environment variable name",
-        default=provider_defaults.get("api_key_env", "API_KEY"),
-        console=console,
-    )
+        base_url = Prompt.ask(
+            "Ollama base URL (leave empty for http://localhost:11434)"
+            if provider_enum == AIProvider.OLLAMA else "Base URL (leave empty for default)",
+            default="", console=console,
+        )
+        api_key_env = Prompt.ask(
+            "API key environment variable name",
+            default=provider_defaults.get("api_key_env", "API_KEY"), console=console,
+        )
 
     # Check if the key is actually set
     if api_key_env and not os.getenv(api_key_env):
@@ -118,6 +133,7 @@ def configure_ai() -> AIConfig | None:
         model=model,
         base_url=base_url or None,
         api_key_env=api_key_env,
+        chatgpt_account=chatgpt_account,
         temperature=0.3,
         max_tokens=8192,
         languages=lang_list,
@@ -125,6 +141,9 @@ def configure_ai() -> AIConfig | None:
 
 
 def _ai_recommendations_available(ai_config: AIConfig) -> bool:
+    if ai_config.provider == AIProvider.OPENAI_CHATGPT:
+        from ..ai.chatgpt_auth import ChatGPTAuth
+        return ChatGPTAuth().status(ai_config.chatgpt_account)["plan_usage"]
     if ai_config.provider == AIProvider.OLLAMA:
         return True
     return bool(ai_config.api_key_env and os.getenv(ai_config.api_key_env))
@@ -397,7 +416,11 @@ def main():
     storage = StorageManager(data_dir=args.data_dir, config_path=args.config)
 
     # Step 1: AI configuration
-    ai_config = configure_ai()
+    try:
+        ai_config = configure_ai()
+    except (RuntimeError, ValueError, OSError) as exc:
+        console.print(f"AI configuration failed: {exc}", markup=False)
+        sys.exit(1)
     if ai_config is None:
         console.print("[red]Setup cancelled.[/red]")
         sys.exit(0)

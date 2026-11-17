@@ -63,7 +63,7 @@ def _client_with_routes(topstories_response, items_by_id, *, topstories_error=Fa
 def test_fetch_returns_empty_when_disabled():
     config = HackerNewsConfig(enabled=False, fetch_top_stories=5, min_score=0)
     scraper = HackerNewsScraper(config, AsyncMock())
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -82,7 +82,7 @@ def test_fetch_processes_stories():
     config = HackerNewsConfig(fetch_top_stories=10, min_score=100)
     scraper = HackerNewsScraper(config, client)
 
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
 
     # Story 102 has score=50 < 100 → filtered. 103 isn't in items_by_id so it's silently dropped.
     assert len(result) == 1
@@ -99,7 +99,7 @@ def test_fetch_filters_stories_below_min_score():
     client = _client_with_routes(topstories, items)
     config = HackerNewsConfig(fetch_top_stories=5, min_score=100)
     scraper = HackerNewsScraper(config, client)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -108,7 +108,7 @@ def test_fetch_handles_topstories_http_error():
     config = HackerNewsConfig(fetch_top_stories=5)
     scraper = HackerNewsScraper(config, client)
     # Must not raise; returns [] when top-level httpx.HTTPError fires.
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert result == []
 
 
@@ -125,7 +125,7 @@ def test_fetch_skips_deleted_and_dead_comments():
     client = _client_with_routes(topstories, items)
     config = HackerNewsConfig(fetch_top_stories=5, min_score=0)
     scraper = HackerNewsScraper(config, client)
-    result = asyncio.run(scraper.fetch(_since()))
+    result = asyncio.run(scraper.fetch(_since())).items
     assert len(result) == 1
     content = result[0].content or ""
     assert "Alive" in content

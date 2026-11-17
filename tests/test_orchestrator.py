@@ -41,6 +41,7 @@ from src.models import (
     TwitterConfig,
 )
 from src.orchestrator import HorizonOrchestrator, _resolve_proxy
+from src.scrapers.base import FetchResult
 from src.scrapers.reddit import RedditSubredditConfig
 from src.scrapers.rss import RSSSourceConfig
 from src.scrapers.telegram import TelegramChannelConfig
@@ -328,7 +329,7 @@ def test_fetch_all_sources_invokes_all_configured_scrapers(
         if class_name == "RedditScraper":
             scraper.fetch = AsyncMock(side_effect=Exception("reddit-flaky"))
         else:
-            scraper.fetch = AsyncMock(return_value=[fake_item])
+            scraper.fetch = AsyncMock(return_value=FetchResult(items=[fake_item]))
         patches.append(patch(target, return_value=scraper))
 
     with contextlib.ExitStack() as stack:
@@ -415,7 +416,11 @@ def test_analyze_items_calls_analyzer_with_ai_client(
     fake_create.assert_called_once_with(orchestrator.config.ai)
     # Merged (upstream) analyzer takes the profile registry and console.
     fake_analyzer_cls.assert_called_once_with(
-        fake_client, orchestrator.profiles, console=orchestrator.console
+        fake_client,
+        orchestrator.profiles,
+        console=orchestrator.console,
+        concurrency=orchestrator.config.ai.analysis_concurrency,
+        throttle_sec=orchestrator.config.ai.throttle_sec,
     )
     fake_analyzer.analyze_batch.assert_awaited_once_with(items)
     assert out == fake_analyzer.analyze_batch.return_value

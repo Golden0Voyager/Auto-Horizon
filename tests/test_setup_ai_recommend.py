@@ -86,8 +86,8 @@ def test_get_ai_recommendations_tags_each_with_origin_ai(
     minimal_ai_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sources = [
-        {"type": "rss", "description": "x"},
-        {"type": "github_user", "description": "y"},
+        {"type": "rss", "description": "x", "config": {"url": "https://example.com/feed.xml"}},
+        {"type": "github_user", "description": "y", "config": {"username": "openai"}},
     ]
     fake_client = MagicMock()
     fake_client.complete = AsyncMock(return_value='{"sources": ' + str(sources).replace("'", '"') + '}')
@@ -186,7 +186,11 @@ def test_get_ai_recommendations_sync_returns_empty_on_failure(
 def test_get_ai_recommendations_sync_returns_list(
     minimal_ai_config: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources = [{"type": "rss", "description": "x"}]
+    sources = [{
+        "type": "rss",
+        "description": "x",
+        "config": {"url": "https://example.com/feed.xml"},
+    }]
     fake_client = MagicMock()
     fake_client.complete = AsyncMock(
         return_value='{"sources": ' + str(sources).replace("'", '"') + '}'

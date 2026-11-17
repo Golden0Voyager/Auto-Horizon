@@ -344,14 +344,18 @@ def test_ossinsight_row_to_item_category_none_when_unset():
 
 
 def _twitter_raw_item() -> dict:
-    # Local Playwright scraper payload shape (text/datetime keys).
+    # Apify altimis/scweet payload shape consumed by ``_parse_item``.
     return {
-        "tweet_id": "999",
-        "text": "Hello twitter",
-        "datetime": "2025-01-01T12:00:00+00:00",
-        "is_retweet": False,
-        "images": [],
+        "id": "999",
+        "id_str": "999",
+        "created_at": "Wed Jan 01 12:00:00 +0000 2025",
+        "full_text": "Hello twitter",
+        "user": {"screen_name": "alice", "name": "Alice"},
     }
+
+
+def _twitter_since() -> datetime:
+    return datetime(2024, 12, 31, tzinfo=UTC)
 
 
 def test_twitter_parse_item_category_in_metadata():
@@ -359,7 +363,7 @@ def test_twitter_parse_item_category_in_metadata():
         enabled=True, users=["alice"], category="social", profile="twitter-profile"
     )
     scraper = TwitterScraper(cfg, AsyncMock())
-    item = scraper._parse_tweet(_twitter_raw_item(), "alice")
+    item = scraper._parse_item(_twitter_raw_item(), _twitter_since())
     assert item is not None
     assert item.metadata["category"] == "social"
     assert item.profile == "twitter-profile"
@@ -368,6 +372,6 @@ def test_twitter_parse_item_category_in_metadata():
 def test_twitter_parse_item_category_none_when_unset():
     cfg = TwitterConfig(enabled=True, users=["alice"])
     scraper = TwitterScraper(cfg, AsyncMock())
-    item = scraper._parse_tweet(_twitter_raw_item(), "alice")
+    item = scraper._parse_item(_twitter_raw_item(), _twitter_since())
     assert item is not None
     assert item.metadata["category"] is None

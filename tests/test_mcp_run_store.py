@@ -176,14 +176,18 @@ def test_create_run_explicit_id(store: RunStore) -> None:
     assert meta["run_id"] == "my-run-001"
 
 
-def test_create_run_idempotent_on_existing_meta(store: RunStore) -> None:
-    """``create_run`` does NOT overwrite existing meta.json (so a re-call preserves original created_at)."""
+def test_create_run_rejects_existing_run_id(store: RunStore) -> None:
+    """``create_run`` refuses to reuse an existing run id (upstream contract)."""
 
-    meta_first = store.create_run("dup-run")
-    created_at_first = store.load_meta("dup-run")["created_at"]
-    meta_second = store.create_run("dup-run")
-    assert meta_first == meta_second  # same id returned
-    assert store.load_meta("dup-run")["created_at"] == created_at_first
+    created_at_first = store.create_run("dup-run")
+    assert created_at_first == "dup-run"
+    original_meta = store.load_meta("dup-run")
+
+    with pytest.raises(FileExistsError):
+        store.create_run("dup-run")
+
+    # The rejected call must leave the original run untouched.
+    assert store.load_meta("dup-run") == original_meta
 
 
 def test_list_runs_empty(store: RunStore) -> None:

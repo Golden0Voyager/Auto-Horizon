@@ -1,530 +1,352 @@
-"""Twitter scraper using Playwright + Cookie (replaces Apify)."""
+"""Twitter scraper using Apify altimis/scweet actor."""
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
-import random
+import time
 from datetime import UTC, datetime
-from pathlib import Path
+from html import unescape
 
-from pydantic import HttpUrl
+import httpx
+from dateutil.parser import isoparse
 
 from ..models import ContentItem, SourceType, TwitterConfig
-from .base import BaseScraper
+from .base import BaseScraper, FetchResult
 
 logger = logging.getLogger(__name__)
 
-# Optional Playwright imports — gracefully degraded if not installed
-try:
-    from playwright.async_api import async_playwright
-    from playwright_stealth import Stealth
-
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    Stealth = None  # type: ignore[misc,assignment]
-
-
-def _get_proxy() -> str:
-    """Resolve proxy from common env vars (PROXY, http_proxy, all_proxy)."""
-    for key in ("PROXY", "https_proxy", "http_proxy", "all_proxy"):
-        val = os.getenv(key, "").strip()
-        if val:
-            return val
-    return ""
-
-
-PROXY = _get_proxy()
-
-
-def _load_browser_cookies(file_path: str) -> list[dict]:
-    """Read browser-exported cookie JSON and convert to Playwright format."""
-    if not Path(file_path).exists():
-        return []
-    with open(file_path, encoding="utf-8") as f:
-        cookies = json.load(f)
-    pw_cookies = []
-    for c in cookies:
-        pc: dict = {
-            "name": c["name"],
-            "value": c["value"],
-            "domain": c["domain"],
-            "path": c.get("path", "/"),
-            "secure": c.get("secure", True),
-            "httpOnly": c.get("httpOnly", False),
-        }
-        if c.get("expirationDate"):
-            pc["expires"] = c["expirationDate"]
-        pw_cookies.append(pc)
-    return pw_cookies
+_APIFY_BASE = "https://api.apify.com/v2"
+_POLL_INTERVAL = 3.0
+_MAX_WAIT = 180
 
 
 class TwitterScraper(BaseScraper):
-    """Fetch tweets via Playwright + Cookie using GraphQL interception."""
+    """Fetch tweets via the Apify altimis/scweet actor."""
 
-    def __init__(self, config: TwitterConfig, http_client=None):
-        super().__init__(config.model_dump(), http_client)
-        self.twitter_config = config
+    def __init__(self, config: TwitterConfig, http_client: httpx.AsyncClient):
+        super().__init__(config, http_client)
+        self.config = config
 
-    async def fetch(self, since: datetime) -> list[ContentItem]:
-        if not self.twitter_config.enabled:
-            return []
+    async def fetch(self, since: datetime) -> FetchResult:
+        result = FetchResult()
+        if not self.config.enabled:
+            return result
 
-        # ``if u.strip().lstrip("@")`` drops names that become empty after
-        # stripping (e.g. ``"@"``), so a users list containing only such
-        # entries short-circuits instead of launching a browser.
-        users = [u.strip().lstrip("@") for u in self.twitter_config.users if u.strip().lstrip("@")]
-        if not users:
-            logger.debug("No Twitter users configured, skipping.")
-            return []
+        users = [u.strip().lstrip("@") for u in self.config.users if u.strip()]
+        keywords = [k.strip() for k in self.config.keywords if k.strip()]
+        if not users and not keywords:
+            logger.debug("No Twitter users or keywords configured, skipping.")
+            return result
 
-        if not PLAYWRIGHT_AVAILABLE:
-            logger.warning(
-                "Playwright not installed. Run: uv sync --extra twitter && uv run playwright install chromium"
-            )
-            return []
+        token = os.environ.get(self.config.apify_token_env)
+        if not token:
+            result.fail("credentials", ValueError(f"Missing environment variable: {self.config.apify_token_env}"))
+            return result
 
-        cookie_dir = Path(self.twitter_config.cookie_dir)
-        pattern = self.twitter_config.cookie_file_pattern
-        cookie_files = sorted(cookie_dir.glob(pattern))
-        if not cookie_files:
-            logger.warning("No cookie files found matching %s in %s", pattern, cookie_dir)
-            return []
+        max_items = max(100, self.config.fetch_limit)
 
-        logger.info(
-            "Fetching Twitter (Playwright) for %d users using %d cookie sets",
-            len(users),
-            len(cookie_files),
+        if users:
+            logger.info(f"Fetching Twitter (Apify) for users: {users}")
+            await result.collect("profiles", self._collect_from_payload(
+                token,
+                {
+                    "source_mode": "profiles",
+                    "profile_urls": users,
+                    "search_sort": "Latest",
+                    "max_items": max_items,
+                },
+                since,
+            ))
+
+        for keyword in keywords:
+            logger.info(f"Fetching Twitter (Apify) search for keyword: {keyword}")
+            await result.collect(f"search:{keyword}", self._collect_from_payload(
+                token,
+                {
+                    "source_mode": "search",
+                    "search_query": keyword,
+                    "search_sort": "Latest",
+                    "max_items": max_items,
+                },
+                since,
+            ))
+
+        result.items = list({item.id: item for item in result.items}.values())
+        logger.info("Fetched %d tweets via Apify.", len(result.items))
+        return result
+
+    async def _collect_from_payload(
+        self,
+        token: str,
+        payload: dict,
+        since: datetime,
+    ) -> list[ContentItem]:
+        run_id, dataset_id = await self._start_run_with_payload(token, payload)
+        if not run_id or not dataset_id:
+            raise RuntimeError("Apify did not return a run and dataset ID")
+        if not await self._wait_for_run(token, run_id):
+            raise RuntimeError("Apify run failed or timed out")
+        raw_items = await self._fetch_dataset(token, dataset_id)
+        items = []
+        for raw in raw_items:
+            if isinstance(raw, dict) and raw.get("noResults"):
+                continue
+            parsed = self._parse_item(raw, since)
+            if parsed:
+                items.append(parsed)
+        return items
+
+    async def _start_run_with_payload(
+        self, token: str, payload: dict
+    ) -> tuple[str | None, str | None]:
+        url = f"{_APIFY_BASE}/acts/{self.config.actor_id}/runs?token={token}"
+        try:
+            resp = await self.client.post(url, json=payload, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            run_id = data["id"]
+            dataset_id = data["defaultDatasetId"]
+            logger.debug(f"Started Apify run {run_id}, dataset {dataset_id}")
+            return run_id, dataset_id
+        except Exception as exc:
+            raise RuntimeError("Failed to start Apify run") from exc
+
+    async def _start_run(
+        self, token: str, users: list[str]
+    ) -> tuple[str | None, str | None]:
+        return await self._start_run_with_payload(
+            token,
+            {
+                "source_mode": "profiles",
+                "profile_urls": users,
+                "search_sort": "Latest",
+                "max_items": max(100, self.config.fetch_limit),
+            },
         )
 
-        all_items: list[ContentItem] = []
-        failed_users: list[tuple[str, int]] = []
-        lock = asyncio.Lock()
-
-        async with Stealth().use_async(async_playwright()) as p:  # type: ignore[union-attr]
-            launch_kwargs: dict = {"headless": True}
-            if PROXY:
-                launch_kwargs["proxy"] = {"server": PROXY}
-            browser = await p.chromium.launch(**launch_kwargs)
-
-            contexts = []
-            for i, cf in enumerate(cookie_files):
-                cookies = _load_browser_cookies(str(cf))
-                ctx = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/13{i}.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-US",
-                    timezone_id="UTC",
-                    color_scheme="dark",
-                )
-                if cookies:
-                    await ctx.add_cookies(cookies)
-                contexts.append(ctx)
-
-            # Warm-up each context by visiting x.com/home
-            await self._warm_up_contexts(contexts)
-
-            num_contexts = len(contexts)
-
-            async def process_queue(context_idx: int, queue: list[str], is_retry: bool = False):
-                ctx = contexts[context_idx]
-                consecutive_failures = 0
-
-                for username in queue:
-                    wait_time = (
-                        random.uniform(5.0, 10.0) if not is_retry else random.uniform(10.0, 20.0)
-                    )
-                    await asyncio.sleep(wait_time)
-
-                    if consecutive_failures >= 5:
-                        logger.warning("Context #%d cooling down (30s)", context_idx + 1)
-                        await asyncio.sleep(30)
-                        consecutive_failures = 0
-
-                    logger.info("Scraping @%s with cookie #%d...", username, context_idx + 1)
-                    tweets = await self._scrape_user(ctx, username, since)
-
-                    if tweets is not None:
-                        logger.info("  -> @%s: %d tweets found", username, len(tweets))
-                        consecutive_failures = 0
-                        parsed = [item for item in (self._parse_tweet(t, username) for t in tweets) if item]
-                        async with lock:
-                            all_items.extend(parsed)
-                    else:
-                        consecutive_failures += 1
-                        if not is_retry:
-                            async with lock:
-                                failed_users.append((username, context_idx))
-
-            # Round-robin assign users to context queues
-            queues: list[list[str]] = [[] for _ in range(num_contexts)]
-            for i, username in enumerate(users):
-                queues[i % num_contexts].append(username)
-
-            # First pass — all queues in parallel
-            await asyncio.gather(*[process_queue(i, q) for i, q in enumerate(queues)])
-
-            # Retry failed users with a different context
-            if failed_users:
-                logger.info("Retrying %d failed Twitter accounts with alternate cookies", len(failed_users))
-                await asyncio.sleep(20)
-                retry_queues: list[list[str]] = [[] for _ in range(num_contexts)]
-                for username, original_idx in failed_users:
-                    new_idx = (original_idx + 1) % num_contexts if num_contexts >= 2 else 0
-                    retry_queues[new_idx].append(username)
-
-                await asyncio.gather(*[
-                    process_queue(i, q, is_retry=True)
-                    for i, q in enumerate(retry_queues)
-                    if q
-                ])
-
-            for ctx in contexts:
-                await ctx.close()
-            await browser.close()
-
-        logger.info("Fetched %d tweets via Playwright.", len(all_items))
-        return all_items
-
-    async def _warm_up_contexts(self, contexts) -> None:
-        """Visit https://x.com/home in each context so cookies get a chance to
-        authenticate the session before user-specific scraping begins.
-
-        Best-effort: failures are logged but never raised. Production behaviour
-        is unchanged from PR 2 (warm-up was inline in ``fetch``); the extraction
-        exists so Layer 2 tests can monkeypatch this seam and avoid hitting the
-        real x.com during CI.
-        """
-        for i, ctx in enumerate(contexts):
-            page = await ctx.new_page()
+    async def _wait_for_run(self, token: str, run_id: str) -> bool:
+        url = f"{_APIFY_BASE}/actor-runs/{run_id}?token={token}"
+        deadline = time.monotonic() + _MAX_WAIT
+        while (remaining := deadline - time.monotonic()) > 0:
             try:
-                await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=15000)
-                await asyncio.sleep(2)
-                logger.info("Cookie #%d warm-up done", i + 1)
+                async with asyncio.timeout(remaining):
+                    resp = await self.client.get(url, timeout=min(10.0, remaining))
+                if time.monotonic() >= deadline:
+                    break
+                resp.raise_for_status()
+                status = resp.json()["data"]["status"]
+                if status == "SUCCEEDED":
+                    return True
+                if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                    logger.error(f"Apify run {run_id} ended with status: {status}")
+                    return False
             except Exception as exc:
-                logger.warning("Cookie #%d warm-up failed: %s", i + 1, exc)
-            finally:
-                await page.close()
+                logger.warning(f"Error polling Apify run {run_id}: {exc}")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(_POLL_INTERVAL, remaining))
+        logger.warning(f"Apify run {run_id} timed out after {_MAX_WAIT}s.")
+        return False
 
-    async def _scrape_user(self, ctx, username: str, since: datetime) -> list[dict] | None:
-        """Scrape a single user's tweets via GraphQL interception."""
-        page = await ctx.new_page()
-        graphql_tweets: list[dict] = []
-
-        async def handle_response(response):
-            if "UserTweets" not in response.url and "UserByScreenName" not in response.url:
-                return
-            try:
-                data = await response.json()
-
-                def extract_tweets(obj):
-                    if isinstance(obj, dict):
-                        if obj.get("rest_id") and obj.get("legacy"):
-                            legacy = obj["legacy"]
-                            media_entities = (
-                                legacy.get("extended_entities", {}).get("media", [])
-                                or legacy.get("entities", {}).get("media", [])
-                            )
-                            images = [
-                                m["media_url_https"]
-                                for m in media_entities
-                                if m.get("type") == "photo" and m.get("media_url_https")
-                            ]
-                            tweet = {
-                                "tweet_id": obj["rest_id"],
-                                "text": legacy.get("full_text", ""),
-                                "datetime_raw": legacy.get("created_at", ""),
-                                "is_retweet": (
-                                    "retweeted_status_result" in obj.get("core", {})
-                                    or "retweeted_status_id_str" in legacy
-                                ),
-                                "images": images,
-                            }
-                            try:
-                                dt = datetime.strptime(tweet["datetime_raw"], "%a %b %d %H:%M:%S %z %Y")
-                                tweet["datetime"] = dt.isoformat()
-                            except (ValueError, TypeError):
-                                tweet["datetime"] = tweet["datetime_raw"]
-                            graphql_tweets.append(tweet)
-                        for v in obj.values():
-                            extract_tweets(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            extract_tweets(item)
-
-                extract_tweets(data)
-            except Exception as exc:
-                logger.debug("GraphQL parse error: %s", exc)
-
-        page.on("response", handle_response)
-
-        # Block heavy resources
-        async def route_handler(route):
-            if route.request.resource_type in ("media", "image", "video"):
-                await route.abort()
-            else:
-                url = route.request.url.lower()
-                if any(k in url for k in ("google-analytics", "doubleclick", "scribe.twitter.com")):
-                    await route.abort()
-                else:
-                    # fallback() (not continue_()) so that context-level routes
-                    # registered on the browser context — used by Layer 2 tests
-                    # to stub GraphQL responses — still get a chance to intercept.
-                    # With no context routes present (production), fallback()
-                    # proceeds to the real network, matching continue_() behaviour.
-                    await route.fallback()
-
-        await page.route("**/*", route_handler)
-
+    async def _fetch_dataset(self, token: str, dataset_id: str) -> list:
+        url = f"{_APIFY_BASE}/datasets/{dataset_id}/items?token={token}"
         try:
-            await asyncio.sleep(random.uniform(2, 4))
+            resp = await self.client.get(url, timeout=30.0)
+            resp.raise_for_status()
+            rows = resp.json()
+            if not isinstance(rows, list):
+                raise ValueError("Invalid Apify dataset")
+            return rows
+        except Exception as exc:
+            raise RuntimeError("Failed to fetch Apify dataset") from exc
 
-            for attempt in range(3):
-                if attempt > 0:
-                    await asyncio.sleep(random.uniform(5, 10))
-                try:
-                    await page.goto(
-                        f"https://x.com/{username}",
-                        wait_until="domcontentloaded",
-                        timeout=25000,
-                    )
-                    break
-                except Exception as exc:
-                    if "Timeout" in str(exc):
-                        logger.debug("Page load slow (attempt %d/3)", attempt + 1)
-                        if attempt == 2:
-                            break
-                    else:
-                        if attempt == 2:
-                            raise
-                        logger.debug("Page visit error (attempt %d/3): %s", attempt + 1, exc)
-
-            await asyncio.sleep(5)
-            start_time = asyncio.get_event_loop().time()
-
-            # Quick diagnostic: check if page requires login
-            body_text = await page.evaluate("document.body ? document.body.innerText : ''")
-            if body_text and any(k in body_text.lower() for k in ("log in", "sign up", "create account")):
-                logger.warning("  -> @%s page shows login gate — cookie may be invalid", username)
-
-            while (asyncio.get_event_loop().time() - start_time) < 60:
-                if graphql_tweets:
-                    result = []
-                    seen = set()
-                    for t in graphql_tweets:
-                        uid = t.get("tweet_id") or hashlib.md5(t["text"].encode()).hexdigest()
-                        if uid in seen:
-                            continue
-                        seen.add(uid)
-                        try:
-                            tweet_time = datetime.fromisoformat(t["datetime"])
-                            if tweet_time < since:
-                                continue
-                        except Exception:
-                            continue
-                        result.append(t)
-
-                    if result:
-                        logger.info("  -> @%s: %d tweets within time window", username, len(result))
-                        return result[: self.twitter_config.fetch_limit]
-                    logger.info("  -> @%s: intercepted %d tweets but all outside time window", username, len(graphql_tweets))
-                    return []
-
-                # Check for error pages
-                body_text = await page.evaluate("document.body ? document.body.innerText : ''")
-                if body_text and any(
-                    kw in body_text
-                    for kw in ("Retry", "Something went wrong", "出错了", "重新加载")
-                ):
-                    await page.reload(wait_until="load", timeout=30000)
-                    await asyncio.sleep(5)
-
-                # Simulate human browsing
-                await page.mouse.move(random.randint(100, 600), random.randint(100, 600))
-                await page.evaluate(f"window.scrollBy(0, {random.randint(300, 700)})")
-                await asyncio.sleep(random.uniform(2, 4))
-
-                at_bottom = await page.evaluate(
-                    "window.innerHeight + window.scrollY >= document.body.scrollHeight"
-                )
-                if at_bottom and (asyncio.get_event_loop().time() - start_time) > 20:
-                    break
-
-            if not graphql_tweets:
-                logger.warning("  -> @%s: no GraphQL data intercepted (cookie or page issue)", username)
-                return None
+    async def fetch_replies_for_item(self, item: ContentItem) -> list[str]:
+        """Fetch reply texts for one tweet using scweet search mode."""
+        if not self.config.fetch_reply_text:
             return []
 
-        except Exception as exc:
-            logger.warning("Failed to scrape @%s: %s", username, exc)
-            return None
-        finally:
-            await page.close()
+        token = os.environ.get(self.config.apify_token_env)
+        if not token:
+            return []
 
-    def _parse_tweet(self, tweet: dict, username: str) -> ContentItem | None:
-        """Convert raw tweet dict to Horizon ContentItem."""
+        conversation_id = str(item.metadata.get("conversation_id") or "")
+        if not conversation_id:
+            return []
+
+        max_replies = max(self.config.max_replies_per_tweet, 0)
+        if max_replies == 0:
+            return []
+
+        max_items = max(100, max_replies * 5)
+        payload = {
+            "source_mode": "search",
+            "search_query": f"conversation_id:{conversation_id}",
+            "search_sort": "Latest",
+            "max_items": max_items,
+        }
+
+        run_id, dataset_id = await self._start_run_with_payload(token, payload)
+        if not run_id or not dataset_id:
+            return []
+
+        if not await self._wait_for_run(token, run_id):
+            return []
+
+        rows = await self._fetch_dataset(token, dataset_id)
+        return self._extract_reply_lines(item, rows, max_replies)
+
+    def _extract_reply_lines(self, item: ContentItem, rows: list, max_replies: int) -> list[str]:
+        """Convert scweet rows into compact reply lines."""
+        min_likes = max(self.config.reply_min_likes, 0)
+        tweet_id = str(item.metadata.get("tweet_id") or "")
+        own_author = (item.metadata.get("screen_name") or item.author or "").lstrip("@")
+        candidates = []
+
+        for row in rows:
+            if not isinstance(row, dict) or row.get("noResults"):
+                continue
+
+            row_id = str(row.get("id") or "")
+            if row_id.startswith("tweet-"):
+                row_id = row_id[6:]
+            if tweet_id and row_id == tweet_id:
+                continue
+
+            user = row.get("user") or {}
+            handle = (
+                user.get("handle")
+                or row.get("handle")
+                or user.get("username")
+                or "unknown"
+            )
+            if handle and own_author and handle.lstrip("@").lower() == own_author.lower():
+                continue
+
+            text = unescape((row.get("text") or "").strip())
+            if not text:
+                continue
+
+            likes = int(row.get("favorite_count") or 0)
+            replies = int(row.get("reply_count") or 0)
+            if likes < min_likes:
+                continue
+
+            score = likes * 2 + replies
+            line = f"[@{handle} | ❤️ {likes} | 💬 {replies}] {text[:280]}"
+            candidates.append((score, line))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [line for _, line in candidates[:max_replies]]
+
+    @staticmethod
+    def append_discussion_content(item: ContentItem, reply_lines: list[str]) -> bool:
+        """Append reply lines under Top Comments marker."""
+        if not reply_lines:
+            return False
+
+        existing = item.content or ""
+        marker = "--- Top Comments ---"
+        block = "\n".join(reply_lines)
+
+        if marker in existing:
+            if block in existing:
+                return False
+            item.content = existing + "\n" + block
+            return True
+
+        if existing:
+            item.content = existing + f"\n\n{marker}\n" + block
+        else:
+            item.content = f"{marker}\n" + block
+        return True
+
+    def _parse_item(self, item: dict, since: datetime) -> ContentItem | None:
         try:
-            tweet_id = str(tweet.get("tweet_id", ""))
+            created_at_str = item.get("created_at")
+            if not created_at_str:
+                return None
+
+            try:
+                published_at = datetime.strptime(
+                    created_at_str, "%a %b %d %H:%M:%S %z %Y"
+                )
+            except ValueError:
+                published_at = isoparse(created_at_str)
+
+            if published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=UTC)
+
+            if published_at < since:
+                return None
+
+            tweet_id = str(item.get("id_str") or item.get("id") or "")
             if not tweet_id:
                 return None
 
-            text = tweet.get("text", "")
+            # Normalize tweet_id: scweet prefixes with "tweet-"
+            raw_id = item.get("id") or ""
+            numeric_id = (
+                str(raw_id).replace("tweet-", "")
+                if str(raw_id).startswith("tweet-")
+                else tweet_id
+            )
+            conversation_id = str(
+                item.get("conversation_id")
+                or item.get("tweet", {}).get("conversation_id")
+                or numeric_id
+            )
+
+            user = item.get("user") or {}
+            screen_name = (
+                user.get("screen_name")
+                or user.get("username")
+                or user.get("handle")
+                or item.get("handle")
+                or item.get("username")
+                or "unknown"
+            )
+            author = user.get("name") or screen_name
+
+            text = item.get("full_text") or item.get("text") or ""
             if not text:
                 return None
+            text = unescape(text)
 
-            created_at_raw = tweet.get("datetime", "")
-            try:
-                published_at = datetime.fromisoformat(created_at_raw)
-                if published_at.tzinfo is None:
-                    published_at = published_at.replace(tzinfo=UTC)
-            except (ValueError, TypeError):
-                return None
+            url = item.get("url")
+            if not url:
+                permalink = item.get("permalink")
+                if permalink and screen_name != "unknown":
+                    url = f"https://twitter.com/{screen_name}{permalink}"
+                else:
+                    url = f"https://twitter.com/{screen_name}/status/{tweet_id}"
 
             title_body = text[:50].replace("\n", " ").strip()
             if len(text) > 50:
                 title_body += "..."
 
             return ContentItem(
-                id=self._generate_id(SourceType.TWITTER.value, "tweet", tweet_id),
+                id=self._generate_id(SourceType.TWITTER.value, "tweet", numeric_id),
                 source_type=SourceType.TWITTER,
-                title=f"@{username}: {title_body}",
-                url=HttpUrl(f"https://x.com/{username}/status/{tweet_id}"),
+                title=f"@{screen_name}: {title_body}",
+                url=url,
                 content=text,
-                author=username,
+                author=author,
                 published_at=published_at,
-                profile=self.twitter_config.profile,
+                profile=self.config.profile,
                 metadata={
-                    "tweet_id": tweet_id,
-                    "is_retweet": tweet.get("is_retweet", False),
-                    "images": tweet.get("images", []),
-                    "category": self.twitter_config.category,
+                    "tweet_id": numeric_id,
+                    "screen_name": screen_name,
+                    "conversation_id": conversation_id,
+                    "favorite_count": item.get("favorite_count", 0),
+                    "retweet_count": item.get("retweet_count", 0),
+                    "reply_count": item.get("reply_count", 0),
+                    "view_count": item.get("view_count"),
+                    "is_reply": item.get("is_reply", False),
+                    "in_reply_to_status_id": item.get("in_reply_to_status_id"),
+                    "in_reply_to_screen_name": item.get("in_reply_to_screen_name"),
+                    "category": self.config.category,
                 },
             )
         except Exception as exc:
-            logger.debug("Failed to parse tweet: %s", exc)
+            logger.debug(f"Failed to parse tweet: {exc}")
             return None
-
-    async def fetch_replies_for_item(self, item: ContentItem) -> list[str]:
-        """Fetch top replies for a single tweet via the legacy Apify scweet actor.
-
-        Returns formatted markdown lines like ``[@alice | ❤️ 20 | 💬 3] great take``.
-        Returns ``[]`` for any short-circuit case (config disabled, missing
-        conversation_id, missing APIFY token, or upstream failure).
-
-        NOTE: This path remains Apify-based to honour the existing test contract
-        (``tests/test_twitter.py`` uses ``httpx.MockTransport`` against the v2
-        Apify REST endpoints). A future migration to Playwright should mirror
-        the same return shape and config knobs so callers do not change.
-        """
-        if not self.twitter_config.fetch_reply_text:
-            return []
-
-        if self.client is None:
-            return []
-
-        metadata = item.metadata
-        conversation_id = metadata.get("conversation_id") or metadata.get("tweet_id")
-        if not conversation_id:
-            return []
-
-        apify_token = os.getenv(self.twitter_config.apify_token_env, "").strip()
-        if not apify_token:
-            return []
-
-        base_url = "https://api.apify.com/v2"
-        actor_id = self.twitter_config.actor_id
-
-        try:
-            start_resp = await self.client.post(
-                f"{base_url}/acts/{actor_id}/runs",
-                params={"token": apify_token},
-                json={"conversation_id": str(conversation_id)},
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Apify reply run start failed: %s", exc)
-            return []
-
-        if start_resp.status_code >= 400:
-            return []
-
-        run_data = (start_resp.json() or {}).get("data") or {}
-        run_id = run_data.get("id")
-        dataset_id = run_data.get("defaultDatasetId")
-        if not run_id or not dataset_id:
-            return []
-
-        try:
-            status_resp = await self.client.get(
-                f"{base_url}/actor-runs/{run_id}",
-                params={"token": apify_token},
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Apify status poll failed: %s", exc)
-            return []
-
-        if status_resp.status_code >= 400:
-            return []
-
-        status = (status_resp.json() or {}).get("data", {}).get("status")
-        if status != "SUCCEEDED":
-            return []
-
-        try:
-            dataset_resp = await self.client.get(
-                f"{base_url}/datasets/{dataset_id}/items",
-                params={"token": apify_token},
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Apify reply dataset fetch failed: %s", exc)
-            return []
-
-        if dataset_resp.status_code >= 400:
-            return []
-
-        rows = dataset_resp.json() or []
-
-        min_likes = int(self.twitter_config.reply_min_likes or 0)
-        max_n = int(self.twitter_config.max_replies_per_tweet or 0)
-        if max_n <= 0:
-            return []
-
-        scored: list[tuple[int, str]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            likes = int(row.get("favorite_count") or 0)
-            replies = int(row.get("reply_count") or 0)
-            if likes < min_likes:
-                continue
-            user = row.get("user") or {}
-            handle = (
-                (user.get("handle") if isinstance(user, dict) else None)
-                or row.get("handle")
-                or "anon"
-            ).lstrip("@")
-            text = (row.get("text") or "").strip()
-            score = likes + replies * 2
-            line = f"[@{handle} | ❤️ {likes} | 💬 {replies}] {text}"
-            scored.append((score, line))
-
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return [line for _, line in scored[:max_n]]
-
-    @staticmethod
-    def append_discussion_content(item: ContentItem, reply_lines: list[str]) -> bool:
-        """Append ``reply_lines`` under a ``--- Top Comments ---`` marker.
-
-        Mutates ``item.content`` in-place and returns ``True`` when content was
-        appended. Returns ``False`` when ``reply_lines`` is empty so that
-        callers can short-circuit downstream rendering.
-        """
-        if not reply_lines:
-            return False
-        sep = "\n\n--- Top Comments ---\n"
-        item.content = (item.content or "").rstrip() + sep + "\n".join(reply_lines)
-        return True

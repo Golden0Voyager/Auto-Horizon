@@ -2,9 +2,12 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from ..models import DigestConfig
 
 BUILTIN_PROFILES_DIR = Path(__file__).resolve().parents[1] / "_builtin_profiles"
 
@@ -139,26 +142,42 @@ class ProfileRegistry:
                 if normalized and normalized != "auto":
                     self.get(normalized)
             elif isinstance(requested, list):
-                normalized_ids = [
+                normalized = [
                     profile_id.strip()
                     for profile_id in requested
                     if isinstance(profile_id, str) and profile_id.strip()
                 ]
-                if not normalized_ids:
+                if not normalized:
                     raise ValueError("profile candidate list cannot be empty")
-                if len(normalized_ids) != len(requested):
+                if len(normalized) != len(requested):
                     raise ValueError("profile candidates must be non-empty strings")
-                if len(normalized_ids) != len(set(normalized_ids)):
+                if len(normalized) != len(set(normalized)):
                     raise ValueError("profile candidates must be unique")
-                if "auto" in normalized_ids:
+                if "auto" in normalized:
                     raise ValueError("profile candidate list cannot contain 'auto'")
-                for profile_id in normalized_ids:
+                for profile_id in normalized:
                     self.get(profile_id)
             for child in value.values():
                 self.validate_source_references(child)
         elif isinstance(value, list):
             for child in value:
                 self.validate_source_references(child)
+
+    def validate_digest_references(self, digest: "DigestConfig") -> None:
+        """Reject unknown profile IDs in profile-based digest quota groups."""
+        if digest.group_by != "profile":
+            return
+        requested = {
+            profile_id
+            for group in digest.category_groups.values()
+            for profile_id in group.categories
+        }
+        unknown = requested - self.ids
+        if unknown:
+            raise ValueError(
+                'digest.category_groups contains unknown profiles for group_by "profile" '
+                f"({', '.join(sorted(unknown))})"
+            )
 
     @property
     def ids(self) -> set[str]:

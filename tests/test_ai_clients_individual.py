@@ -30,6 +30,19 @@ from src.ai.client import (
 from src.models import AIConfig, AIProvider
 
 
+def _openai_status_error(message: str, status: int = 400):
+    """Build a real ``openai.APIStatusError``.
+
+    The clients only retry on the SDK's status errors (400/422); a bare
+    ``Exception`` models nothing the SDK actually raises.
+    """
+    import httpx
+    from openai import APIStatusError
+
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    return APIStatusError(message, response=httpx.Response(status, request=request), body=None)
+
+
 def _patch_record_usage(monkeypatch):
     """Patch ``src.ai.client.record_usage`` to a list-collecting spy."""
     calls: list[dict] = []
@@ -170,7 +183,9 @@ def test_anthropic_complete_overrides_temperature_and_max_tokens(monkeypatch):
     asyncio.run(
         AnthropicClient(cfg).complete("sys", "usr", temperature=0.9, max_tokens=128)
     )
-    assert captured["temperature"] == 0.9
+    # SDK 1.x no longer accepts ``temperature`` as a keyword; it rides along in
+    # ``extra_body`` so the transport still sends it.
+    assert captured["extra_body"]["temperature"] == 0.9
     assert captured["max_tokens"] == 128
 
 
@@ -326,7 +341,7 @@ def test_openai_complete_temperature_unsupported_triggers_silent_retry(monkeypat
     async def _create(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise Exception("temperature is not supported by this model")
+            raise _openai_status_error("temperature is not supported by this model")
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="after-retry"))],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=4),
@@ -466,7 +481,7 @@ def test_azure_complete_token_kwarg_fallback_from_max_tokens_to_max_completion(m
     async def _create(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise Exception("unsupported parameter: max_tokens; use max_completion_tokens")
+            raise _openai_status_error("unsupported parameter: max_tokens; use max_completion_tokens")
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="retry"))],
             usage=None,

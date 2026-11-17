@@ -39,7 +39,7 @@ import httpx
 from pydantic import HttpUrl
 
 from ..models import ContentItem, GoogleNewsConfig, SourceType
-from .base import BaseScraper
+from .base import BaseScraper, FetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,13 @@ class GoogleNewsScraper(BaseScraper):
         super().__init__({"google_news": config}, http_client)
         self.gn_config = config
 
-    async def fetch(self, since: datetime) -> list[ContentItem]:
+    async def fetch(self, since: datetime) -> FetchResult:
+        result = FetchResult()
+        if self.gn_config.enabled:
+            await result.collect("search", self._fetch_articles(since))
+        return result
+
+    async def _fetch_articles(self, since: datetime) -> list[ContentItem]:
         """Fetch articles from the Google News RSS search endpoint.
 
         Args:
@@ -68,7 +74,7 @@ class GoogleNewsScraper(BaseScraper):
                 the Google News ``when:``/``after:`` query operator).
 
         Returns:
-            List[ContentItem]: Fetched content items.
+            list[ContentItem]: Fetched content items.
         """
         if not self.gn_config.enabled:
             return []
@@ -87,29 +93,22 @@ class GoogleNewsScraper(BaseScraper):
             "ceid": ceid,
         }
 
-        try:
-            response = await self.http.get(
-                self.BASE_URL, params=params, follow_redirects=True
-            )
-            response.raise_for_status()
+        response = await self.client.get(
+            self.BASE_URL, params=params, follow_redirects=True
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.text)
+        if feed.bozo and not feed.entries:
+            raise ValueError("Invalid Google News RSS feed")
 
-            feed = feedparser.parse(response.text)
-
-            items: list[ContentItem] = []
-            for entry in feed.entries:
-                if len(items) >= self.gn_config.max_results:
-                    break
-                item = self._entry_to_item(entry)
-                if item is not None:
-                    items.append(item)
-            return items
-
-        except httpx.HTTPError as exc:
-            logger.warning("Error fetching Google News feed: %s", exc)
-            return []
-        except Exception as exc:
-            logger.warning("Error parsing Google News feed: %s", exc)
-            return []
+        items: list[ContentItem] = []
+        for entry in feed.entries:
+            if len(items) >= self.gn_config.max_results:
+                break
+            item = self._entry_to_item(entry)
+            if item is not None and item.published_at >= self._ensure_utc(since):
+                items.append(item)
+        return items
 
     def _time_operator(self, since: datetime) -> str:
         """Build the Google News time operator from ``since``.
@@ -198,7 +197,8 @@ class GoogleNewsScraper(BaseScraper):
                         return datetime.fromtimestamp(
                             calendar.timegm(parsed), tz=UTC
                         )
-                    return parsedate_to_datetime(entry[field])
+                    moment = parsedate_to_datetime(entry[field])
+                    return GoogleNewsScraper._ensure_utc(moment)
                 except Exception:
                     continue
         return None

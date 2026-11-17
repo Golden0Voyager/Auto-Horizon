@@ -2,15 +2,17 @@
 
 import asyncio
 import logging
+import math
 import re
-from datetime import datetime
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from pydantic import HttpUrl
 
 from ..models import ContentItem, SourceType, TelegramChannelConfig, TelegramConfig
-from .base import BaseScraper
+from .base import BaseScraper, FetchResult
 
 logger = logging.getLogger(__name__)
 
@@ -30,31 +32,18 @@ class TelegramScraper(BaseScraper):
         super().__init__(config.model_dump(), http_client)
         self.telegram_config = config
 
-    async def fetch(self, since: datetime) -> list[ContentItem]:
+    async def fetch(self, since: datetime) -> FetchResult:
+        result = FetchResult()
         if not self.config.get("enabled", True):
-            return []
+            return result
 
         tasks = []
         for channel_cfg in self.telegram_config.channels:
             if channel_cfg.enabled:
-                tasks.append(self._fetch_channel(channel_cfg, since))
+                tasks.append(result.collect(channel_cfg.channel, self._fetch_channel(channel_cfg, since)))
 
-        if not tasks:
-            return []
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        items = []
-        failures = []
-        for result in results:
-            if isinstance(result, Exception):
-                failures.append(result)
-                logger.warning("Error fetching Telegram channel: %s", result)
-            elif isinstance(result, list):
-                items.extend(result)
-
-        if failures and len(failures) == len(results):
-            raise RuntimeError(f"All Telegram channels failed: {failures[0]}") from failures[0]
-        return items
+        await asyncio.gather(*tasks)
+        return result
 
     async def _fetch_channel(self, cfg: TelegramChannelConfig, since: datetime) -> list[ContentItem]:
         headers = {"User-Agent": USER_AGENT}
@@ -63,12 +52,22 @@ class TelegramScraper(BaseScraper):
         for web_base in TELEGRAM_WEB_BASES:
             url = f"{web_base}/{cfg.channel}"
             try:
-                response = await self.http.get(url, headers=headers, follow_redirects=True, timeout=120.0)
+                response = await self.client.get(url, headers=headers, follow_redirects=True, timeout=120.0)
                 if response.status_code == 429:
-                    retry_after = int(response.headers.get("Retry-After", 5))
+                    try:
+                        retry_after = int(response.headers.get("Retry-After", 5))
+                    except ValueError:
+                        try:
+                            retry_at = parsedate_to_datetime(response.headers["Retry-After"])
+                            if retry_at.tzinfo is None:
+                                retry_at = retry_at.replace(tzinfo=UTC)
+                            retry_after = math.ceil((retry_at - datetime.now(UTC)).total_seconds())
+                        except (TypeError, ValueError, OverflowError):
+                            retry_after = 5
+                    retry_after = max(0, retry_after)
                     logger.warning("Telegram rate limited for %s, retrying after %ds", cfg.channel, retry_after)
                     await asyncio.sleep(retry_after)
-                    response = await self.http.get(url, headers=headers, follow_redirects=True, timeout=120.0)
+                    response = await self.client.get(url, headers=headers, follow_redirects=True, timeout=120.0)
                 response.raise_for_status()
                 return self._parse_channel_html(response.text, cfg, since)
             except httpx.HTTPError as exc:
@@ -144,7 +143,13 @@ class TelegramScraper(BaseScraper):
         canonical_url = msg_url
         for a in text_el.find_all("a", href=True):
             href = a["href"]
-            if href.startswith("http") and "t.me" not in href:
+            try:
+                parsed = urlsplit(href)
+            except ValueError:
+                continue
+            if parsed.scheme in {"http", "https"} and parsed.hostname not in {
+                "t.me", "telegram.me", "telegram.dog",
+            } and parsed.hostname:
                 canonical_url = href
                 break
 
@@ -152,7 +157,7 @@ class TelegramScraper(BaseScraper):
             id=self._generate_id("telegram", channel, msg_id),
             source_type=SourceType.TELEGRAM,
             title=title,
-            url=HttpUrl(canonical_url),
+            url=canonical_url,
             content=text,
             author=channel,
             published_at=published_at,
