@@ -9,7 +9,7 @@ on:
 
 jobs:
   daily-summary:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write  # 允许修改仓库内容以保存总结
 
